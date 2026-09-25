@@ -232,7 +232,7 @@ def dashboard_cmd(
         Panel.fit(
             f"Starting dashboard on http://{host}:{port}\n"
             "From your laptop (recommended SSH tunnel):\n"
-            "  gcloud compute ssh pmcup-bots1 --zone=YOUR_ZONE -- -L 8080:localhost:8080\n"
+            "  gcloud compute ssh pmcup-bots1 --zone=us-east4-b -- -L 8080:localhost:8080\n"
             "Then open http://127.0.0.1:8080",
             title="Dashboard",
         )
