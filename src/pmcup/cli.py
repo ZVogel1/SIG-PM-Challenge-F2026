@@ -215,6 +215,31 @@ def bots_status() -> None:
         console.print(data)
 
 
+@app.command("dashboard")
+def dashboard_cmd(
+    host: str = typer.Option("127.0.0.1", help="Bind address (0.0.0.0 to expose on VM)"),
+    port: int = typer.Option(8080, help="Port"),
+) -> None:
+    """
+    Open a live web dashboard: balance, rank, positions, bot decisions.
+
+    Safe default binds to localhost. On the GCP VM use host 0.0.0.0 and an SSH tunnel,
+    or open firewall port 8080.
+    """
+    from .dashboard import serve
+
+    console.print(
+        Panel.fit(
+            f"Starting dashboard on http://{host}:{port}\n"
+            "From your laptop (recommended SSH tunnel):\n"
+            "  gcloud compute ssh pmcup-bots1 --zone=YOUR_ZONE -- -L 8080:localhost:8080\n"
+            "Then open http://127.0.0.1:8080",
+            title="Dashboard",
+        )
+    )
+    serve(host=host, port=port)
+
+
 @app.command("setup")
 def setup_cmd() -> None:
     """Create local folders and example fair-probability sheet."""

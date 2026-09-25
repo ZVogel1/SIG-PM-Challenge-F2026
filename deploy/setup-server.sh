@@ -34,6 +34,11 @@ sed -e "s|WorkingDirectory=.*|WorkingDirectory=$ROOT|" \
     -e "s|Environment=PYTHONPATH=.*|Environment=PYTHONPATH=$ROOT/src|" \
     "$SERVICE_SRC" | sudo tee "$SERVICE_DST" >/dev/null
 
+echo "==> Bootstrapping fair probs + forecasts (first-time)"
+export PYTHONPATH="$ROOT/src"
+"$ROOT/.venv/bin/python" -m pmcup bootstrap-probs || true
+"$ROOT/.venv/bin/python" -m pmcup update-probs || true
+
 sudo systemctl daemon-reload
 sudo systemctl enable pmcup-bots
 sudo systemctl restart pmcup-bots

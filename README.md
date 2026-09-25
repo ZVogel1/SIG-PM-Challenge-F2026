@@ -51,6 +51,22 @@ Live orders stay disabled until you set `DRY_RUN=false` in `.env`.
 
 Optional but powerful: spend 30–60 min/day updating fair probs on the ~20 most liquid / most mispriced races the scanner surfaces. Ignore the rest; FLB + constraints still work.
 
+## Live dashboard
+
+```bash
+# on the GCP VM (inside the project + venv)
+export PYTHONPATH=$PWD/src
+python -m pmcup dashboard --host 127.0.0.1 --port 8080
+```
+
+On your laptop, tunnel it securely:
+```bash
+gcloud compute ssh pmcup-bots1 --zone=YOUR_ZONE -- -L 8080:localhost:8080
+```
+Then open http://127.0.0.1:8080
+
+Shows mode, balance, rank, positions, leaderboard, and recent bot decisions (auto-refresh every 30s).
+
 ## Unattended bots (you don't need to watch all day)
 
 Three bots share one account and decide every few minutes:
