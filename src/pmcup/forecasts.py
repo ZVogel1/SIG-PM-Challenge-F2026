@@ -7,9 +7,26 @@ from typing import Any
 import httpx
 import pandas as pd
 
+from .config import settings
 from .fair_probs import default_path
 
 VOTEPREDICTOR_BASE = "https://votepredictor.com/api/v1"
+MANUAL_SOURCES = {"manual", "user", "locked", "human"}
+
+
+def _is_protected_row(row: dict | pd.Series, *, protect: bool) -> bool:
+    if not protect:
+        return False
+    locked = str(row.get("locked") or "").strip().lower()
+    if locked in {"1", "true", "yes", "y"}:
+        return True
+    src = str(row.get("source") or "").strip().lower()
+    if src in MANUAL_SOURCES:
+        return True
+    notes = str(row.get("notes") or "").lower()
+    if notes.startswith("manual") or "[manual]" in notes:
+        return True
+    return False
 
 STATE_ABBR = {
     "alabama": "AL",
@@ -202,15 +219,22 @@ def update_fair_probs_from_forecasts(
     path: Path | None = None,
     *,
     blend_with_market: float = 0.0,
+    protect_manual: bool | None = None,
 ) -> dict[str, Any]:
     """
     Overwrite fair_yes using VotePredictor poll/fundamentals consensus.
 
     blend_with_market: 0 = pure forecast, 0.3 = 70% forecast + 30% current fair_yes.
+    Rows with source manual/user/locked, locked=true, or notes starting with Manual
+    are skipped when protect_manual is on (default from settings).
     """
     path = path or default_path()
     if not path.exists():
         raise FileNotFoundError(f"{path} missing — run pmcup bootstrap-probs first")
+
+    protect = (
+        settings.protect_manual_fair_probs if protect_manual is None else protect_manual
+    )
 
     df = pd.read_csv(path)
     # Ensure metadata columns exist with writable dtypes (pandas may infer float NaNs)
@@ -226,6 +250,10 @@ def update_fair_probs_from_forecasts(
         df["confidence"] = 0.7
     else:
         df["confidence"] = pd.to_numeric(df["confidence"], errors="coerce").fillna(0.7)
+    if "locked" not in df.columns:
+        df["locked"] = ""
+    else:
+        df["locked"] = df["locked"].astype("string").fillna("")
 
     # fair_yes must stay numeric-friendly for writes
     df["fair_yes"] = pd.to_numeric(df["fair_yes"], errors="coerce")
@@ -234,11 +262,20 @@ def update_fair_probs_from_forecasts(
 
     forecast = build_forecast_index()
     matched = 0
+    protected = 0
     missing_gov: set[str] = set()
+    unmatched_titles: list[str] = []
 
     for i, row in df.iterrows():
-        parsed = parse_market_title(str(row.get("title") or ""))
+        if _is_protected_row(row, protect=protect):
+            protected += 1
+            continue
+
+        title = str(row.get("title") or "")
+        parsed = parse_market_title(title)
         if not parsed:
+            if title:
+                unmatched_titles.append(title[:80])
             continue
 
         rid = parsed["race_id"]
@@ -291,15 +328,27 @@ def update_fair_probs_from_forecasts(
             "forecast_source",
             "n_polls",
             "confidence",
+            "locked",
         ]
         if c in df.columns
     ]
     extra = [c for c in df.columns if c not in cols]
     df[cols + extra].to_csv(path, index=False)
+    # unique unmatched titles (cap for status/dashboard)
+    seen: set[str] = set()
+    missing_titles: list[str] = []
+    for t in unmatched_titles:
+        if t not in seen:
+            seen.add(t)
+            missing_titles.append(t)
+        if len(missing_titles) >= 40:
+            break
     return {
         "path": str(path),
         "matched": matched,
+        "protected": protected,
         "forecast_cache_size": len(forecast),
         "missing_governor_ids": sorted(missing_gov),
+        "unparsed_titles": missing_titles,
         "attribution": "Forecasts from votepredictor.com (free API, polls + fundamentals).",
     }

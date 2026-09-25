@@ -135,6 +135,31 @@ kill "$(cat data/bots/runner.pid)" 2>/dev/null
 
 Logs: `data/bots/runner.log` · Decisions: `data/bots/decisions.jsonl`
 
+### Keep-alive without sudo (recommended on this VM)
+
+If you cannot use systemd, run the watchdog once (or add it as a GCP **startup script**):
+
+```bash
+cd ~/SIG-PM-Challenge-F2026
+chmod +x deploy/watchdog.sh
+nohup ./deploy/watchdog.sh > data/bots/watchdog.out 2>&1 &
+```
+
+It restarts bots + dashboard if they die, and survives VM reboots when set as a startup script.
+
+With sudo available: `sudo bash deploy/setup-server.sh` installs `pmcup-bots` + `pmcup-dashboard` with `Restart=always`.
+
+### Safety / edge upgrades (built-in)
+
+- **Trading window** — live orders only Oct 1–Nov 4 2026 12:00 ET (`ENFORCE_TRADING_WINDOW`)
+- **Race exposure caps** — won't stack > `MAX_RACE_EXPOSURE_FRAC` of bankroll into one contest
+- **No live FLB** — heuristic trades without a fair_probs row stay paper-only unless `ALLOW_FLB_LIVE=true`
+- **Manual fair probs protected** — set `source=manual` or `locked=true` so auto-refresh won't overwrite
+- **API retries** + stable order idempotency keys
+- **Runner stays up** after failed cycles (emails on streak); use watchdog/systemd for process death
+- **Richer alerts** — stop, cycle failures, order failures (`NOTIFY_ON_ERRORS`)
+- **Dashboard** — staleness, fail streak, missing forecasts, paper PnL scoreboard
+
 ### Start the dashboard (on the VM)
 
 ```bash
@@ -219,7 +244,16 @@ DRY_RUN=false
 LIVE_TRADING=true
 ```
 
-Then restart the bots so they pick up the new settings. Until both are set, everything stays paper/dry.
+Restart bots so they pick up settings. Live orders still require the official window (`ENFORCE_TRADING_WINDOW=true` by default).
+
+Protect hand-edited rows in `data/fair_probs.csv` with `source=manual` or `locked=true`.
+
+## Tests
+
+```bash
+pip install -e ".[dev]"
+pytest
+```
 
 ---
 

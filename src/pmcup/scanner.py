@@ -98,6 +98,7 @@ def scan(cfg: Settings | None = None) -> dict[str, Any]:
         fair = load_fair_probs()
 
         ideas: list[TradeIdea] = []
+        missing_forecasts: list[dict[str, str]] = []
         for q in quotes:
             if q.exchange_id in fair:
                 fp = fair[q.exchange_id]
@@ -109,8 +110,15 @@ def scan(cfg: Settings | None = None) -> dict[str, Any]:
                     max_frac=cfg.max_position_frac,
                     min_edge=cfg.min_edge,
                     confidence=fp.confidence,
+                    min_net_edge=cfg.min_edge,
                 )
             else:
+                missing_forecasts.append(
+                    {
+                        "exchange_id": q.exchange_id,
+                        "title": q.market_title[:80],
+                    }
+                )
                 idea = edge_from_flb(
                     q,
                     bankroll=bankroll,
@@ -153,6 +161,8 @@ def scan(cfg: Settings | None = None) -> dict[str, Any]:
             "market_count": len(markets),
             "quote_count": len(quotes),
             "fair_prob_count": len(fair),
+            "missing_forecasts": missing_forecasts[:50],
+            "missing_forecast_count": len(missing_forecasts),
             "ideas": ranked,
             "quotes": quotes,
             "constraint_violations": constraints.get("violationsCount", 0),

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import threading
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -11,6 +10,8 @@ from urllib.parse import urlparse
 from .bots.runner import pid_path, status_path
 from .client import SuperMarketClient
 from .config import settings
+from .paper_scoreboard import summarize_paper
+from .trading_window import window_status
 
 
 def _read_json(path: Path) -> Any:
@@ -39,7 +40,6 @@ def _tail_jsonl(path: Path, n: int = 40) -> list[dict[str, Any]]:
 def _bot_running() -> bool:
     path = pid_path()
     if not path.exists():
-        # also detect nohup process via status freshness? keep simple
         return False
     try:
         import os
@@ -50,17 +50,36 @@ def _bot_running() -> bool:
         return False
 
 
+def _status_age_seconds(status: dict[str, Any]) -> float | None:
+    ts = status.get("updated_at")
+    if not ts:
+        return None
+    try:
+        when = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+        return max(0.0, (datetime.now(timezone.utc) - when).total_seconds())
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def collect_snapshot() -> dict[str, Any]:
     """Live API + local bot artifacts."""
     slug = settings.tournament_slug or "midterm-elections"
+    status = _read_json(status_path()) or {}
+    age = _status_age_seconds(status)
+    stale = age is not None and age > float(settings.bot_status_stale_seconds)
     snap: dict[str, Any] = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "slug": slug,
         "dry_run": settings.dry_run,
         "live_trading": settings.can_trade_live,
+        "latches_live": settings.latches_allow_live,
+        "trading_window": window_status(),
         "bot_running_pidfile": _bot_running(),
-        "bot_status": _read_json(status_path()) or {},
+        "bot_status": status,
+        "bot_status_age_s": age,
+        "bot_status_stale": stale,
         "recent_decisions": _tail_jsonl(Path("data/bots/decisions.jsonl"), 50),
+        "paper": summarize_paper(),
         "account": {},
         "positions": [],
         "position_summary": {},
@@ -92,13 +111,27 @@ def _fmt_money(v: Any) -> str:
         return "—"
 
 
+def _fmt_age(seconds: float | None) -> str:
+    if seconds is None:
+        return "—"
+    if seconds < 90:
+        return f"{int(seconds)}s"
+    if seconds < 3600:
+        return f"{int(seconds // 60)}m"
+    return f"{seconds / 3600:.1f}h"
+
+
 def render_html(data: dict[str, Any]) -> str:
     acct = data.get("account") or {}
     summary = data.get("position_summary") or {}
     board = data.get("leaderboard") or {}
     status = data.get("bot_status") or {}
+    paper = data.get("paper") or {}
+    window = data.get("trading_window") or {}
     mode = "LIVE" if data.get("live_trading") else "PAPER/DRY"
-    running = "YES" if data.get("bot_running_pidfile") else "unknown / no pidfile"
+    running = "YES" if data.get("bot_running_pidfile") else "no / unknown"
+    stale = bool(data.get("bot_status_stale"))
+    health = "STALE" if stale else ("OK" if data.get("bot_running_pidfile") else "CHECK")
 
     rows_pos = []
     for p in data.get("positions") or []:
@@ -145,6 +178,11 @@ def render_html(data: dict[str, Any]) -> str:
     if not rows_dec:
         rows_dec.append("<tr><td colspan='7' class='muted'>No bot decisions logged yet</td></tr>")
 
+    missing = status.get("missing_forecasts") or []
+    miss_html = "".join(
+        f"<li>{_esc(m.get('title') or m.get('exchange_id'))}</li>" for m in missing[:15]
+    ) or "<li class='muted'>All open quotes have a fair_probs row</li>"
+
     top = status.get("top") or []
     top_html = "".join(
         f"<li><strong>{_esc(t.get('bot'))}</strong> "
@@ -154,8 +192,27 @@ def render_html(data: dict[str, Any]) -> str:
         for t in top[:8]
     ) or "<li class='muted'>No proposals in last status</li>"
 
-    err = data.get("error")
-    err_html = f"<div class='banner bad'>API error: {_esc(err)}</div>" if err else ""
+    banners = []
+    if data.get("error"):
+        banners.append(f"<div class='banner bad'>API error: {_esc(data.get('error'))}</div>")
+    if stale:
+        banners.append(
+            f"<div class='banner warn'>Bot status is stale "
+            f"({_esc(_fmt_age(data.get('bot_status_age_s')))} old). "
+            "Check the VM runner.</div>"
+        )
+    if status.get("error") or status.get("error_code"):
+        banners.append(
+            f"<div class='banner bad'>Last cycle error: "
+            f"{_esc(status.get('error') or status.get('error_code'))} "
+            f"(fail streak {_esc(status.get('fail_streak', 0))})</div>"
+        )
+    if data.get("latches_live") and not data.get("live_trading"):
+        banners.append(
+            "<div class='banner warn'>Live latches are ON but outside the official "
+            "trading window — orders stay paper.</div>"
+        )
+    err_html = "".join(banners)
 
     return f"""<!doctype html>
 <html lang="en">
@@ -169,11 +226,11 @@ def render_html(data: dict[str, Any]) -> str:
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet" />
   <style>
     :root {{
-      --bg: #f3efe6;
-      --ink: #1c1a16;
-      --muted: #6b6458;
-      --line: #d9d0c0;
-      --panel: #fffdf8;
+      --bg: #eef2f4;
+      --ink: #15202b;
+      --muted: #5b6b7a;
+      --line: #c9d4dc;
+      --panel: #ffffff;
       --good: #1f6b45;
       --warn: #8a5a00;
       --bad: #9b1c1c;
@@ -185,8 +242,8 @@ def render_html(data: dict[str, Any]) -> str:
       font-family: "IBM Plex Sans", sans-serif;
       color: var(--ink);
       background:
-        radial-gradient(1200px 500px at 10% -10%, #e7f1f5 0%, transparent 55%),
-        radial-gradient(900px 400px at 100% 0%, #f7e7d4 0%, transparent 50%),
+        radial-gradient(1000px 420px at 0% 0%, #d9ebf2 0%, transparent 55%),
+        radial-gradient(800px 360px at 100% 0%, #e4e9ef 0%, transparent 50%),
         var(--bg);
     }}
     main {{ max-width: 1100px; margin: 0 auto; padding: 28px 18px 60px; }}
@@ -238,6 +295,7 @@ def render_html(data: dict[str, Any]) -> str:
       border: 1px solid var(--line);
     }}
     .banner.bad {{ background: #fdecec; color: var(--bad); }}
+    .banner.warn {{ background: #fff6e5; color: var(--warn); }}
     ul {{ margin: 0; padding-left: 18px; }}
     li {{ margin: 6px 0; }}
     footer {{ color: var(--muted); font-size: 0.85rem; margin-top: 8px; }}
@@ -248,7 +306,8 @@ def render_html(data: dict[str, Any]) -> str:
   <header>
     <div>
       <h1>Predictions Cup</h1>
-      <div class="sub">Tournament <strong>{_esc(data.get('slug'))}</strong> · auto-refresh 30s</div>
+      <div class="sub">Tournament <strong>{_esc(data.get('slug'))}</strong> · window
+        <strong>{_esc(window.get('phase'))}</strong> · auto-refresh 30s</div>
     </div>
     <div class="sub">Updated {_esc(str(data.get('generated_at') or '')[:19])}Z</div>
   </header>
@@ -263,15 +322,34 @@ def render_html(data: dict[str, Any]) -> str:
   </div>
 
   <div class="grid">
-    <div class="stat"><div class="label">Bot pidfile</div><div class="value" style="font-size:1rem">{running}</div></div>
+    <div class="stat"><div class="label">Bot health</div><div class="value" style="font-size:1rem">{health}</div></div>
+    <div class="stat"><div class="label">Status age</div><div class="value">{_esc(_fmt_age(data.get('bot_status_age_s')))}</div></div>
     <div class="stat"><div class="label">Last cycle</div><div class="value">{_esc(status.get('cycle', '—'))}</div></div>
+    <div class="stat"><div class="label">Fail streak</div><div class="value">{_esc(status.get('fail_streak', 0))}</div></div>
+  </div>
+
+  <div class="grid">
+    <div class="stat"><div class="label">Bot pidfile</div><div class="value" style="font-size:1rem">{running}</div></div>
     <div class="stat"><div class="label">Proposals</div><div class="value">{_esc(status.get('proposals', '—'))}</div></div>
-    <div class="stat"><div class="label">Executed</div><div class="value">{_esc(status.get('executed', '—'))}</div></div>
+    <div class="stat"><div class="label">Executed / ok</div><div class="value">{_esc(status.get('executed', '—'))}/{_esc(status.get('ok', '—'))}</div></div>
+    <div class="stat"><div class="label">Missing forecasts</div><div class="value">{_esc(status.get('missing_forecast_count', len(missing)))}</div></div>
+  </div>
+
+  <div class="grid">
+    <div class="stat"><div class="label">Paper fills</div><div class="value">{_esc(paper.get('fill_count', 0))}</div></div>
+    <div class="stat"><div class="label">Paper total PnL</div><div class="value">{_fmt_money(paper.get('total_pnl'))}</div></div>
+    <div class="stat"><div class="label">Paper open lots</div><div class="value">{_esc(paper.get('open_lots', 0))}</div></div>
+    <div class="stat"><div class="label">Paper open $</div><div class="value">{_fmt_money(paper.get('open_notional'))}</div></div>
   </div>
 
   <section>
     <h2>Last bot proposals</h2>
     <ul>{top_html}</ul>
+  </section>
+
+  <section>
+    <h2>Markets missing fair probs</h2>
+    <ul>{miss_html}</ul>
   </section>
 
   <section>
@@ -302,6 +380,7 @@ def render_html(data: dict[str, Any]) -> str:
     User: {_esc(acct.get('username') or acct.get('email') or acct.get('id'))}
     · Market value {_fmt_money(summary.get('totalMarketValue'))}
     · Cost basis {_fmt_money(summary.get('totalCostBasis'))}
+    · Dashboard binds localhost by default — use SSH tunnel only
   </footer>
 </main>
 </body>

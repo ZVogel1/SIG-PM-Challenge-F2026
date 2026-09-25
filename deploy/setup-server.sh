@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# Run on the Azure VM after cloning the repo.
+# Run on the GCP VM after cloning the repo.
+# Prefer: sudo bash deploy/setup-server.sh
+# If you do not have sudo, use deploy/watchdog.sh via a startup script instead.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -23,16 +25,26 @@ if [[ ! -f .env ]]; then
   exit 1
 fi
 
-echo "==> Installing systemd service"
-SERVICE_SRC="$ROOT/deploy/pmcup-bots.service"
-SERVICE_DST="/etc/systemd/system/pmcup-bots.service"
-# Rewrite WorkingDirectory/User for this machine
+echo "==> Installing systemd services (bots + dashboard)"
 USER_NAME="$(whoami)"
-sed -e "s|WorkingDirectory=.*|WorkingDirectory=$ROOT|" \
-    -e "s|User=.*|User=$USER_NAME|" \
-    -e "s|ExecStart=.*|ExecStart=$ROOT/.venv/bin/python -m pmcup.bots.daemon|" \
-    -e "s|Environment=PYTHONPATH=.*|Environment=PYTHONPATH=$ROOT/src|" \
-    "$SERVICE_SRC" | sudo tee "$SERVICE_DST" >/dev/null
+install_unit() {
+  local src="$1"
+  local name="$2"
+  local dst="/etc/systemd/system/$name"
+  sed -e "s|WorkingDirectory=.*|WorkingDirectory=$ROOT|" \
+      -e "s|User=.*|User=$USER_NAME|" \
+      -e "s|Environment=PYTHONPATH=.*|Environment=PYTHONPATH=$ROOT/src|" \
+      "$src" | sudo tee "$dst" >/dev/null
+  # Fix ExecStart paths inside the rewritten unit
+  if [[ "$name" == "pmcup-bots.service" ]]; then
+    sudo sed -i "s|ExecStart=.*|ExecStart=$ROOT/.venv/bin/python -m pmcup.bots.daemon|" "$dst"
+  else
+    sudo sed -i "s|ExecStart=.*|ExecStart=$ROOT/.venv/bin/python -m pmcup dashboard --host 127.0.0.1 --port 8080|" "$dst"
+  fi
+}
+
+install_unit "$ROOT/deploy/pmcup-bots.service" "pmcup-bots.service"
+install_unit "$ROOT/deploy/pmcup-dashboard.service" "pmcup-dashboard.service"
 
 echo "==> Bootstrapping fair probs + forecasts (first-time)"
 export PYTHONPATH="$ROOT/src"
@@ -40,11 +52,13 @@ export PYTHONPATH="$ROOT/src"
 "$ROOT/.venv/bin/python" -m pmcup update-probs || true
 
 sudo systemctl daemon-reload
-sudo systemctl enable pmcup-bots
-sudo systemctl restart pmcup-bots
+sudo systemctl enable pmcup-bots pmcup-dashboard
+sudo systemctl restart pmcup-bots pmcup-dashboard
 
 echo "==> Done"
-sudo systemctl status pmcup-bots --no-pager
+sudo systemctl status pmcup-bots --no-pager || true
+sudo systemctl status pmcup-dashboard --no-pager || true
 echo
 echo "Logs: journalctl -u pmcup-bots -f"
 echo "Or:   tail -f $ROOT/data/bots/runner.log"
+echo "Dash: gcloud compute ssh pmcup-bots1 --zone=us-east4-b -- -L 8080:localhost:8080"

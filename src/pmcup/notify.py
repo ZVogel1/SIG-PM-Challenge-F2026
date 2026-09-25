@@ -23,10 +23,12 @@ def send_email(
     subject: str,
     body: str,
     cfg: Settings | None = None,
+    *,
+    force: bool = False,
 ) -> bool:
     """Send a plain-text email. Returns True on success. No-ops if not configured."""
     cfg = cfg or settings
-    if not cfg.notify_on_stop:
+    if not force and not (cfg.notify_on_stop or cfg.notify_on_errors):
         return False
     if not email_configured(cfg):
         log.warning("Email notify skipped — set NOTIFY_EMAIL_TO + SMTP_* in .env")
@@ -53,7 +55,17 @@ def send_email(
         return False
 
 
+def notify_alert(subject: str, body: str, cfg: Settings | None = None) -> None:
+    cfg = cfg or settings
+    if not cfg.notify_on_errors and not cfg.notify_on_stop:
+        return
+    send_email(subject, body, cfg=cfg, force=True)
+
+
 def notify_bots_stopped(reason: str, *, cycle: int | None = None, extra: str = "") -> None:
+    cfg = settings
+    if not cfg.notify_on_stop:
+        return
     subject = f"[Predictions Cup] Bots stopped — {reason}"
     body = (
         f"Your Predictions Cup bot runner stopped.\n\n"
@@ -64,4 +76,28 @@ def notify_bots_stopped(reason: str, *, cycle: int | None = None, extra: str = "
         f"Restart with: ./pmcup bots run\n"
         f"Logs: data/bots/runner.log\n"
     )
-    send_email(subject, body)
+    send_email(subject, body, cfg=cfg, force=True)
+
+
+def notify_cycle_failures(fail_streak: int, *, cycle: int, error: str) -> None:
+    cfg = settings
+    if not cfg.notify_on_errors:
+        return
+    subject = f"[Predictions Cup] {fail_streak} failed bot cycles"
+    body = (
+        f"Bot cycles are failing but the runner is staying up.\n\n"
+        f"Fail streak: {fail_streak}\n"
+        f"Cycle: {cycle}\n"
+        f"Last error: {error}\n\n"
+        f"Check: data/bots/runner.log and ./pmcup bots status\n"
+    )
+    send_email(subject, body, cfg=cfg, force=True)
+
+
+def notify_order_failures(failures: list[str]) -> None:
+    cfg = settings
+    if not cfg.notify_on_errors or not failures:
+        return
+    subject = f"[Predictions Cup] {len(failures)} order failure(s)"
+    body = "Some bot orders failed this cycle:\n\n" + "\n".join(f"- {f}" for f in failures[:20])
+    send_email(subject, body, cfg=cfg, force=True)

@@ -1,5 +1,5 @@
 [Unit]
-Description=Predictions Cup multi-bot runner
+Description=Predictions Cup live dashboard
 After=network-online.target
 Wants=network-online.target
 
@@ -9,9 +9,9 @@ User=pmcup_zvogel
 WorkingDirectory=/home/pmcup_zvogel/SIG-PM-Challenge-F2026
 Environment=PYTHONPATH=/home/pmcup_zvogel/SIG-PM-Challenge-F2026/src
 Environment=PYTHONUNBUFFERED=1
-ExecStart=/home/pmcup_zvogel/SIG-PM-Challenge-F2026/.venv/bin/python -m pmcup.bots.daemon
+ExecStart=/home/pmcup_zvogel/SIG-PM-Challenge-F2026/.venv/bin/python -m pmcup dashboard --host 127.0.0.1 --port 8080
 Restart=always
-RestartSec=15
+RestartSec=10
 
 [Install]
 WantedBy=multi-user.target

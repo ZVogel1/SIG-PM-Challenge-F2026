@@ -15,6 +15,7 @@ HEADERS = [
     "forecast_source",
     "n_polls",
     "confidence",
+    "locked",
 ]
 
 
@@ -136,6 +137,7 @@ def bootstrap_template(
                     "forecast_source": "",
                     "n_polls": 0,
                     "confidence": 0.4,
+                    "locked": "",
                 }
             )
     pd.DataFrame(rows, columns=HEADERS).to_csv(path, index=False)

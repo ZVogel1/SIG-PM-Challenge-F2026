@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import logging
+import time
 import uuid
 from typing import Any
 
 import httpx
 
 from .config import Settings, settings
+
+log = logging.getLogger("pmcup.client")
 
 
 class SuperMarketClient:
@@ -34,16 +38,62 @@ class SuperMarketClient:
     def __exit__(self, *args: object) -> None:
         self.close()
 
+    def _should_retry(self, exc: BaseException, response: httpx.Response | None) -> bool:
+        if isinstance(exc, (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError)):
+            return True
+        if response is not None and response.status_code in {408, 425, 429, 500, 502, 503, 504}:
+            return True
+        return False
+
+    def _request(self, method: str, path: str, **kwargs: Any) -> Any:
+        retries = max(1, int(self.cfg.http_max_retries))
+        backoff = float(self.cfg.http_retry_backoff_s)
+        last_exc: BaseException | None = None
+        for attempt in range(retries):
+            response: httpx.Response | None = None
+            try:
+                response = self._client.request(method, path, **kwargs)
+                if response.status_code in {408, 425, 429, 500, 502, 503, 504}:
+                    if attempt + 1 < retries:
+                        sleep_s = backoff * (2**attempt)
+                        log.warning(
+                            "HTTP %s on %s %s — retry %s/%s in %.1fs",
+                            response.status_code,
+                            method,
+                            path,
+                            attempt + 1,
+                            retries,
+                            sleep_s,
+                        )
+                        time.sleep(sleep_s)
+                        continue
+                response.raise_for_status()
+                return response.json()
+            except Exception as exc:  # noqa: BLE001
+                last_exc = exc
+                if attempt + 1 >= retries or not self._should_retry(exc, response):
+                    raise
+                sleep_s = backoff * (2**attempt)
+                log.warning(
+                    "Request error on %s %s (%s) — retry %s/%s in %.1fs",
+                    method,
+                    path,
+                    exc,
+                    attempt + 1,
+                    retries,
+                    sleep_s,
+                )
+                time.sleep(sleep_s)
+        if last_exc:
+            raise last_exc
+        raise RuntimeError(f"Request failed: {method} {path}")
+
     def _get(self, path: str, **params: Any) -> Any:
         clean = {k: v for k, v in params.items() if v is not None}
-        r = self._client.get(path, params=clean)
-        r.raise_for_status()
-        return r.json()
+        return self._request("GET", path, params=clean)
 
     def _post(self, path: str, body: dict[str, Any]) -> Any:
-        r = self._client.post(path, json=body)
-        r.raise_for_status()
-        return r.json()
+        return self._request("POST", path, json=body)
 
     def account(self) -> dict[str, Any]:
         return self._get("/account")

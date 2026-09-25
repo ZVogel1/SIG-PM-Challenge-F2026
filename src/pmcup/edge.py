@@ -23,9 +23,12 @@ def edge_from_fair(
     max_frac: float,
     min_edge: float,
     confidence: float = 1.0,
-    min_net_edge: float = 0.03,
+    min_net_edge: float | None = None,
 ) -> TradeIdea | None:
     """Model-vs-market using executable prices and spread-aware net edge."""
+    # Align net-edge floor with configured min_edge unless overridden
+    if min_net_edge is None:
+        min_net_edge = min_edge
     spread = quote.implied_spread()
     half_spread = spread / 2.0
 
@@ -132,7 +135,7 @@ def edge_from_flb(
         max_frac=max_frac * 0.4,
         min_edge=0.025,
         confidence=0.35,
-        min_net_edge=0.025,
+        min_net_edge=0.025,  # FLB keeps a lower bar; live bots can filter source=flb
     )
     if idea is None:
         return None

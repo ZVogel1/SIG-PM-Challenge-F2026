@@ -11,9 +11,11 @@ from typing import Any
 from ..client import SuperMarketClient
 from ..config import Settings, settings
 from ..forecasts import update_fair_probs_from_forecasts
-from ..notify import notify_bots_stopped
+from ..notify import notify_bots_stopped, notify_cycle_failures
+from ..paper_scoreboard import summarize_paper
 from ..research import snapshot_scan
 from ..scanner import scan
+from ..trading_window import window_status
 from .executor import Executor, bots_dir
 from .risk import risk_exit_proposals
 from .strategies import proposals_from_constraints, proposals_from_edge_ideas
@@ -61,10 +63,17 @@ def write_status(payload: dict[str, Any]) -> None:
 
 def run_cycle(cfg: Settings, *, cycle: int = 0) -> dict[str, Any]:
     """One multi-bot decision cycle."""
+    forecast_meta: dict[str, Any] = {}
     if cfg.bot_refresh_forecasts_every_n > 0 and cycle % cfg.bot_refresh_forecasts_every_n == 0:
         try:
-            upd = update_fair_probs_from_forecasts()
-            log.info("Refreshed forecasts: %s rows", upd["matched"])
+            forecast_meta = update_fair_probs_from_forecasts(
+                protect_manual=cfg.protect_manual_fair_probs
+            )
+            log.info(
+                "Refreshed forecasts: matched=%s protected=%s",
+                forecast_meta.get("matched"),
+                forecast_meta.get("protected"),
+            )
         except Exception:  # noqa: BLE001
             log.exception("Forecast refresh failed")
 
@@ -73,10 +82,11 @@ def run_cycle(cfg: Settings, *, cycle: int = 0) -> dict[str, Any]:
     proposals: list[OrderProposal] = []
 
     if cfg.bot_enable_edge:
-        proposals.extend(proposals_from_edge_ideas(ideas))
+        proposals.extend(proposals_from_edge_ideas(ideas, cfg=cfg))
     if cfg.bot_enable_constraint:
         proposals.extend(proposals_from_constraints(ideas))
 
+    positions: dict[str, Any] = {"positions": []}
     with SuperMarketClient(cfg) as client:
         if cfg.bot_enable_risk:
             try:
@@ -96,7 +106,13 @@ def run_cycle(cfg: Settings, *, cycle: int = 0) -> dict[str, Any]:
                 best_buy[key] = p
         merged = sells + list(best_buy.values())
 
-        executor = Executor(client, cfg, result["tournament_id"])
+        executor = Executor(
+            client,
+            cfg,
+            result["tournament_id"],
+            bankroll=float(result.get("bankroll") or 100_000),
+            positions_payload=positions,
+        )
         executed = executor.execute(merged)
 
     try:
@@ -104,13 +120,30 @@ def run_cycle(cfg: Settings, *, cycle: int = 0) -> dict[str, Any]:
     except Exception:  # noqa: BLE001
         log.exception("Snapshot failed")
 
+    paper = {}
+    try:
+        paper = summarize_paper()
+    except Exception:  # noqa: BLE001
+        log.exception("Paper summary failed")
+
     summary = {
         "cycle": cycle,
         "slug": result["slug"],
         "live": cfg.can_trade_live,
+        "latches_live": cfg.latches_allow_live,
+        "trading_window": window_status(),
         "proposals": len(merged),
         "executed": len(executed),
         "ok": sum(1 for r in executed if r.get("ok")),
+        "fail": sum(1 for r in executed if not r.get("ok")),
+        "missing_forecasts": result.get("missing_forecasts") or [],
+        "missing_forecast_count": len(result.get("missing_forecasts") or []),
+        "forecast_refresh": {
+            "matched": forecast_meta.get("matched"),
+            "protected": forecast_meta.get("protected"),
+            "missing_governor_ids": forecast_meta.get("missing_governor_ids"),
+        },
+        "paper": paper,
         "top": [
             {
                 "bot": p.bot,
@@ -125,11 +158,12 @@ def run_cycle(cfg: Settings, *, cycle: int = 0) -> dict[str, Any]:
     }
     write_status(summary)
     log.info(
-        "Cycle %s done | live=%s proposals=%s executed=%s",
+        "Cycle %s done | live=%s proposals=%s executed=%s missing_forecasts=%s",
         cycle,
         cfg.can_trade_live,
         len(merged),
         len(executed),
+        summary["missing_forecast_count"],
     )
     return summary
 
@@ -139,15 +173,21 @@ def run_forever(cfg: Settings | None = None) -> None:
     log_path = setup_logging()
     pid_path().write_text(str(os.getpid()))
     log.info(
-        "Bot runner started pid=%s interval=%ss live=%s dry_run=%s log=%s",
+        "Bot runner started pid=%s interval=%ss live=%s dry_run=%s window=%s log=%s",
         os.getpid(),
         cfg.bot_interval_seconds,
         cfg.can_trade_live,
         cfg.dry_run,
+        window_status().get("phase"),
         log_path,
     )
 
-    state: dict[str, Any] = {"cycle": 0, "stop_reason": "unknown", "fail_streak": 0}
+    state: dict[str, Any] = {
+        "cycle": 0,
+        "stop_reason": "unknown",
+        "fail_streak": 0,
+        "notified_fail_streak": 0,
+    }
 
     def _handle_signal(signum: int, _frame: Any) -> None:
         state["stop_reason"] = f"signal {signum}"
@@ -161,6 +201,7 @@ def run_forever(cfg: Settings | None = None) -> None:
             try:
                 run_cycle(cfg, cycle=state["cycle"])
                 state["fail_streak"] = 0
+                sleep_s = max(30, int(cfg.bot_interval_seconds))
             except SystemExit:
                 raise
             except Exception as exc:  # noqa: BLE001
@@ -169,17 +210,28 @@ def run_forever(cfg: Settings | None = None) -> None:
                 write_status(
                     {
                         "cycle": state["cycle"],
-                        "error": "cycle_failed",
+                        "error": str(exc),
+                        "error_code": "cycle_failed",
                         "live": cfg.can_trade_live,
                         "fail_streak": state["fail_streak"],
+                        "trading_window": window_status(),
                     }
                 )
-                # Email if cycles keep failing (likely stuck / broken)
-                if state["fail_streak"] >= 3:
-                    state["stop_reason"] = f"crash after {state['fail_streak']} failed cycles: {exc}"
-                    break
+                # Notify once per streak threshold; keep running for infra durability
+                streak = int(state["fail_streak"])
+                threshold = max(1, int(cfg.bot_fail_notify_streak))
+                if streak >= threshold and streak != int(state["notified_fail_streak"]):
+                    try:
+                        notify_cycle_failures(streak, cycle=int(state["cycle"]), error=str(exc))
+                        state["notified_fail_streak"] = streak
+                    except Exception:  # noqa: BLE001
+                        log.exception("Fail-streak notify failed")
+                sleep_s = max(
+                    int(cfg.bot_fail_backoff_s),
+                    int(cfg.bot_interval_seconds),
+                ) * min(streak, 5)
             state["cycle"] = int(state["cycle"]) + 1
-            time.sleep(max(30, int(cfg.bot_interval_seconds)))
+            time.sleep(sleep_s)
     except SystemExit:
         if state["stop_reason"] == "unknown":
             state["stop_reason"] = "stopped"

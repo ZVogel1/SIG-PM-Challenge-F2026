@@ -325,7 +325,9 @@ def update_probs_cmd(
     console.print(
         Panel.fit(
             f"Updated {result['matched']} rows in {result['path']}\n"
+            f"Protected (manual/locked) rows skipped: {result.get('protected', 0)}\n"
             f"{result['attribution']}\n"
+            "Tip: set source=manual or locked=true to keep your overrides.\n"
             "Next: pmcup scan",
             title="Fair probs ← consensus forecast",
         )

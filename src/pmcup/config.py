@@ -16,10 +16,16 @@ class Settings(BaseSettings):
     dry_run: bool = True
     # Second safety latch — must be true AND dry_run false for live orders
     live_trading: bool = False
+    # Refuse live orders outside Oct 1–Nov 4 2026 ET even if latches are on
+    enforce_trading_window: bool = True
     tournament_kelly_mult: float = 1.75
     min_edge: float = 0.04
     max_position_frac: float = 0.25
+    # Cap total notional per underlying race (across Dem/Rep mirrors)
+    max_race_exposure_frac: float = 0.25
     request_timeout_s: float = 30.0
+    http_max_retries: int = 3
+    http_retry_backoff_s: float = 0.75
 
     # Unattended multi-bot runner
     bot_interval_seconds: int = 180
@@ -30,9 +36,22 @@ class Settings(BaseSettings):
     bot_enable_risk: bool = True
     bot_exit_net_edge: float = 0.01  # flatten when net edge collapses below this
     bot_take_profit_frac: float = 0.35  # sell if uPnL% exceeds this (paper/live)
+    # Underwater trim when no scan idea exists for the position
+    bot_underwater_exit_frac: float = -0.20
+    # Keep running after failures (systemd/watchdog restart). Notify after N fails.
+    bot_fail_notify_streak: int = 3
+    bot_fail_backoff_s: int = 60
+    # FLB heuristic: paper OK by default; blocked for live unless explicitly enabled
+    allow_flb_paper: bool = True
+    allow_flb_live: bool = False
+    # Never overwrite fair_probs rows marked manual/user/locked
+    protect_manual_fair_probs: bool = True
+    # Seconds before bot status is considered stale on the dashboard
+    bot_status_stale_seconds: int = 600
 
-    # Email alerts when bots stop/crash
+    # Email alerts
     notify_on_stop: bool = True
+    notify_on_errors: bool = True
     notify_email_to: str = ""
     notify_email_from: str = ""
     smtp_host: str = ""
@@ -51,8 +70,18 @@ class Settings(BaseSettings):
         return self.supermarket_api_key
 
     @property
-    def can_trade_live(self) -> bool:
+    def latches_allow_live(self) -> bool:
         return self.live_trading and not self.dry_run
+
+    @property
+    def can_trade_live(self) -> bool:
+        if not self.latches_allow_live:
+            return False
+        if self.enforce_trading_window:
+            from .trading_window import in_live_window
+
+            return in_live_window()
+        return True
 
 
 settings = Settings()

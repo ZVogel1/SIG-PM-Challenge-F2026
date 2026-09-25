@@ -15,8 +15,9 @@ def risk_exit_proposals(
 ) -> list[OrderProposal]:
     """
     Flatten or reduce positions when:
-    - forecast edge has disappeared, or
-    - unrealized gain is large enough to bank for tournament variance
+    - forecast edge has disappeared / flipped,
+    - unrealized gain is large enough to bank for tournament variance,
+    - underwater with no active idea (illiquid / unscanned holding).
     """
     idea_by_ex: dict[str, TradeIdea] = {i.exchange_id: i for i in ideas}
     out: list[OrderProposal] = []
@@ -41,6 +42,7 @@ def risk_exit_proposals(
         should_exit = False
         reason = ""
         priority = 0.0
+        full_exit = False
 
         if upnl_pct >= cfg.bot_take_profit_frac:
             should_exit = True
@@ -51,6 +53,7 @@ def risk_exit_proposals(
             same_side_edge = idea.side == side and idea.action == "buy"
             if not same_side_edge and idea.net_edge >= cfg.min_edge:
                 should_exit = True
+                full_exit = True
                 reason = (
                     f"Edge flipped against us (now {idea.action} {idea.side}, "
                     f"net {idea.net_edge:.1%})"
@@ -58,15 +61,22 @@ def risk_exit_proposals(
                 priority = 800 + idea.net_edge * 100
             elif same_side_edge and idea.net_edge < cfg.bot_exit_net_edge:
                 should_exit = True
+                full_exit = True
                 reason = f"Edge decayed to {idea.net_edge:.1%} < exit bar"
                 priority = 700
-        # If no idea and underwater badly, optional small trim skipped for now
+        elif upnl_pct <= cfg.bot_underwater_exit_frac:
+            should_exit = True
+            full_exit = True
+            reason = (
+                f"No scan idea and underwater {upnl_pct:.0%} "
+                f"<= {cfg.bot_underwater_exit_frac:.0%}"
+            )
+            priority = 650
 
         if not should_exit:
             continue
 
-        # Sell half on take-profit, full on flip/decay
-        sell_qty = abs_qty if "flipped" in reason.lower() or "decayed" in reason.lower() else max(1, abs_qty // 2)
+        sell_qty = abs_qty if full_exit else max(1, abs_qty // 2)
         sell_qty = min(sell_qty, abs_qty)
         mark = pos.get("currentPrice")
         out.append(
