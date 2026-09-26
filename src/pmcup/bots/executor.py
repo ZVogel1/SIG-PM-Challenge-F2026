@@ -9,9 +9,15 @@ from typing import Any
 
 from ..client import SuperMarketClient
 from ..config import Settings
+from ..edge import basket_from_title
 from ..notify import notify_order_failures
 from ..paper_scoreboard import record_paper_fills
-from ..portfolio import cap_buy_quantity, exposure_by_race
+from ..portfolio import (
+    basket_cap_frac,
+    cap_buy_quantity,
+    exposure_by_basket,
+    exposure_by_race,
+)
 from ..sizing import round_tick
 from ..trading_window import window_status
 from .types import OrderProposal
@@ -57,6 +63,7 @@ class Executor:
 
     def execute(self, proposals: list[OrderProposal]) -> list[dict[str, Any]]:
         exposure = exposure_by_race(self.positions_payload)
+        basket_exp = exposure_by_basket(self.positions_payload)
         # Highest priority first, unique by exchange+side+action
         uniq: dict[str, OrderProposal] = {}
         for p in sorted(proposals, key=lambda x: x.priority, reverse=True):
@@ -69,6 +76,8 @@ class Executor:
         for p in uniq.values():
             qty = p.quantity
             if p.action == "buy":
+                title = p.market_title or ""
+                basket = basket_from_title(title)
                 qty = cap_buy_quantity(
                     quantity=qty,
                     price=p.price,
@@ -77,18 +86,24 @@ class Executor:
                     exposure=exposure,
                     max_race_frac=self.cfg.max_race_exposure_frac,
                     max_position_frac=self.cfg.max_position_frac,
+                    basket=basket,
+                    basket_exposure=basket_exp,
+                    max_basket_frac=basket_cap_frac(basket, self.cfg),
                 )
                 if qty <= 0:
                     log.info(
-                        "Skip buy (exposure cap): %s race=%s",
+                        "Skip buy (exposure/basket cap): %s race=%s basket=%s",
                         p.market_title[:50],
                         p.race_key,
+                        basket,
                     )
                     continue
                 # Reserve room for later proposals in this same cycle
                 px = float(p.price) if p.price is not None and p.price > 0 else 0.5
                 key = p.race_key or p.exchange_id
-                exposure[key] = exposure.get(key, 0.0) + qty * px
+                notional = qty * px
+                exposure[key] = exposure.get(key, 0.0) + notional
+                basket_exp[basket] = basket_exp.get(basket, 0.0) + notional
             if qty != p.quantity:
                 p = OrderProposal(**{**p.__dict__, "quantity": qty})
             adjusted.append(p)

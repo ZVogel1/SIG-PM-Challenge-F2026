@@ -14,6 +14,44 @@ def race_key_from_title(title: str) -> str:
     return t
 
 
+def basket_from_title(title: str) -> str:
+    """Correlate races into House / Senate / Gov baskets for portfolio caps."""
+    key = race_key_from_title(title)
+    if "house" in key:
+        return "house"
+    if "senate" in key:
+        return "senate"
+    if "governor" in key or key.endswith(" gov"):
+        return "gov"
+    return "other"
+
+
+def blend_fair_with_market(
+    model_fair: float,
+    market_mid: float | None,
+    confidence: float,
+    *,
+    strength: float = 1.0,
+) -> tuple[float, float]:
+    """
+    Shrink model probability toward the market as confidence falls.
+
+    effective = (1 - w) * model + w * market
+    where w = (1 - confidence) * strength
+
+    Returns (blended_fair, market_weight).
+    """
+    model_fair = max(0.001, min(0.999, float(model_fair)))
+    conf = max(0.0, min(1.0, float(confidence)))
+    strength = max(0.0, min(1.0, float(strength)))
+    if market_mid is None or strength <= 0:
+        return model_fair, 0.0
+    market = max(0.001, min(0.999, float(market_mid)))
+    w_market = (1.0 - conf) * strength
+    blended = (1.0 - w_market) * model_fair + w_market * market
+    return max(0.001, min(0.999, blended)), w_market
+
+
 def edge_from_fair(
     quote: Quote,
     fair_yes: float,
@@ -24,11 +62,21 @@ def edge_from_fair(
     min_edge: float,
     confidence: float = 1.0,
     min_net_edge: float | None = None,
+    market_blend_strength: float = 0.0,
 ) -> TradeIdea | None:
     """Model-vs-market using executable prices and spread-aware net edge."""
     # Align net-edge floor with configured min_edge unless overridden
     if min_net_edge is None:
         min_net_edge = min_edge
+
+    raw_model = fair_yes
+    fair_yes, w_mkt = blend_fair_with_market(
+        fair_yes,
+        quote.mid,
+        confidence,
+        strength=market_blend_strength,
+    )
+
     spread = quote.implied_spread()
     half_spread = spread / 2.0
 
@@ -60,6 +108,12 @@ def edge_from_fair(
             "Buy NO."
         )
 
+    if w_mkt > 0.01:
+        rationale = (
+            f"Blended vs market (w={w_mkt:.0%}, model {raw_model:.0%}→{fair_yes:.0%}). "
+            + rationale
+        )
+
     net_edge = raw_edge - half_spread
     if net_edge < min_net_edge or raw_edge < min_edge:
         return None
@@ -78,6 +132,12 @@ def edge_from_fair(
         return None
 
     score = net_edge * stake * confidence
+    tags = ["model_vs_market", "spread_aware"]
+    if w_mkt > 0.01:
+        tags.append("market_blend")
+    basket = basket_from_title(quote.market_title)
+    tags.append(f"basket:{basket}")
+
     return TradeIdea(
         market_id=quote.market_id,
         market_title=quote.market_title,
@@ -91,7 +151,7 @@ def edge_from_fair(
         stake=stake,
         rationale=rationale,
         source="fair_prob",
-        tags=["model_vs_market", "spread_aware"],
+        tags=tags,
         net_edge=net_edge,
         spread=spread,
         race_key=race_key_from_title(quote.market_title),

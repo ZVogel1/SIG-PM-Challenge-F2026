@@ -23,6 +23,15 @@ class Settings(BaseSettings):
     max_position_frac: float = 0.25
     # Cap total notional per underlying race (across Dem/Rep mirrors)
     max_race_exposure_frac: float = 0.25
+    # Correlated basket caps (House seats move together, etc.)
+    max_house_basket_frac: float = 0.55
+    max_senate_basket_frac: float = 0.40
+    max_gov_basket_frac: float = 0.30
+    max_other_basket_frac: float = 0.25
+    # Shrink model fair probs toward market mid as confidence falls
+    blend_toward_market: bool = True
+    # 1.0 = full (1-confidence) weight on market; 0.5 = gentler shrink
+    market_blend_strength: float = 1.0
     request_timeout_s: float = 30.0
     http_max_retries: int = 3
     http_retry_backoff_s: float = 0.75

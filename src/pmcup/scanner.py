@@ -111,6 +111,9 @@ def scan(cfg: Settings | None = None) -> dict[str, Any]:
                     min_edge=cfg.min_edge,
                     confidence=fp.confidence,
                     min_net_edge=cfg.min_edge,
+                    market_blend_strength=(
+                        cfg.market_blend_strength if cfg.blend_toward_market else 0.0
+                    ),
                 )
             else:
                 missing_forecasts.append(
