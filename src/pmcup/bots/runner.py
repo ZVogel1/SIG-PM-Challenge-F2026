@@ -10,6 +10,7 @@ from typing import Any
 
 from ..client import SuperMarketClient
 from ..config import Settings, settings
+from ..equity import record_equity_point
 from ..forecasts import update_fair_probs_from_forecasts
 from ..notify import notify_bots_stopped, notify_cycle_failures
 from ..paper_scoreboard import summarize_paper
@@ -125,6 +126,31 @@ def run_cycle(cfg: Settings, *, cycle: int = 0) -> dict[str, Any]:
         paper = summarize_paper()
     except Exception:  # noqa: BLE001
         log.exception("Paper summary failed")
+
+    try:
+        acct = result.get("account") or {}
+        summary = positions.get("summary") or {}
+        cash = acct.get("balance")
+        if cash is None:
+            cash = result.get("bankroll")
+        record_equity_point(
+            cash=float(cash) if cash is not None else None,
+            positions_mv=(
+                float(summary["totalMarketValue"])
+                if summary.get("totalMarketValue") is not None
+                else None
+            ),
+            upnl=(
+                float(summary["totalUnrealizedPnl"])
+                if summary.get("totalUnrealizedPnl") is not None
+                else None
+            ),
+            rank=(result.get("leaderboard") or {}).get("myRank"),
+            paper_pnl=paper.get("total_pnl"),
+            live=cfg.can_trade_live,
+        )
+    except Exception:  # noqa: BLE001
+        log.exception("Equity point failed")
 
     summary = {
         "cycle": cycle,

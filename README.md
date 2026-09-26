@@ -79,11 +79,25 @@ gcloud compute instances list
 
 ### SSH into the VM
 
+Always include the Linux username **`pmcup_zvogel`** (that’s whose home has the repo). Plain `gcloud compute ssh pmcup-bots1` logs you in as your Mac username and you’ll get “No such file”.
+
 ```bash
-gcloud compute ssh pmcup-bots1 --zone=us-east4-b
+# shell / logs
+gcloud compute ssh pmcup_zvogel@pmcup-bots1 --zone=us-east4-b
+
+# shell + dashboard tunnel
+gcloud compute ssh pmcup_zvogel@pmcup-bots1 --zone=us-east4-b -- -L 8080:localhost:8080
 ```
 
-(If asked for a **passphrase**, that’s the password for your SSH private key on the Mac — not your Google password. Typing is invisible; press Enter after typing.)
+Optional Mac shortcuts (already in `~/.zshrc` if set up locally):
+
+```bash
+pmcup-ssh      # SSH as pmcup_zvogel
+pmcup-dash     # SSH + port 8080 tunnel → http://127.0.0.1:8080
+pmcup-status   # one-shot bot status without interactive shell
+```
+
+After `source ~/.zshrc` (or open a new terminal), use those instead of typing the long command.
 
 ### First-time (or after `git push`) on the VM
 
@@ -137,15 +151,36 @@ Logs: `data/bots/runner.log` · Decisions: `data/bots/decisions.jsonl`
 
 ### Keep-alive without sudo (recommended on this VM)
 
-If you cannot use systemd, run the watchdog once (or add it as a GCP **startup script**):
+Bots must be started **detached** (not tied to your SSH window). From an SSH session:
 
 ```bash
 cd ~/SIG-PM-Challenge-F2026
-chmod +x deploy/watchdog.sh
-nohup ./deploy/watchdog.sh > data/bots/watchdog.out 2>&1 &
+source .venv/bin/activate
+export PYTHONPATH=$PWD/src
+mkdir -p data/bots
+
+nohup python -m pmcup.bots.daemon >> data/bots/runner.log 2>&1 </dev/null &
+echo $! > data/bots/runner.pid
+nohup python -m pmcup dashboard --host 127.0.0.1 --port 8080 >> data/bots/dashboard.log 2>&1 </dev/null &
+echo $! > data/bots/dashboard.pid
+nohup bash ./deploy/watchdog.sh >> data/bots/watchdog.out 2>&1 </dev/null &
+echo $! > data/bots/watchdog.pid
+disown -a
 ```
 
-It restarts bots + dashboard if they die, and survives VM reboots when set as a startup script.
+Confirm processes show `?` for TTY (not `pts/0`):
+```bash
+ps -u "$USER" -o pid=,tty=,args= | grep -E 'pmcup|watchdog' | grep -v grep
+```
+
+Closing your laptop only drops SSH/tunnel — it does **not** stop detached VM processes. To view logs again later:
+
+```bash
+gcloud compute ssh pmcup_zvogel@pmcup-bots1 --zone=us-east4-b
+tail -f ~/SIG-PM-Challenge-F2026/data/bots/runner.log
+```
+
+GCP **startup-script** metadata on `pmcup-bots1` starts `deploy/watchdog.sh` after reboot.
 
 With sudo available: `sudo bash deploy/setup-server.sh` installs `pmcup-bots` + `pmcup-dashboard` with `Restart=always`.
 
