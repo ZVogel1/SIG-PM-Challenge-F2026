@@ -53,17 +53,22 @@ class Executor:
         *,
         bankroll: float = 100_000.0,
         positions_payload: dict[str, Any] | None = None,
+        size_mult: float = 1.0,
     ) -> None:
         self.client = client
         self.cfg = cfg
         self.tournament_id = tournament_id
         self.bankroll = bankroll
         self.positions_payload = positions_payload or {"positions": []}
+        self.size_mult = max(0.0, min(1.0, float(size_mult)))
         self.decisions_path = bots_dir() / "decisions.jsonl"
 
     def execute(self, proposals: list[OrderProposal]) -> list[dict[str, Any]]:
         exposure = exposure_by_race(self.positions_payload)
         basket_exp = exposure_by_basket(self.positions_payload)
+        size_mult = self.size_mult
+        if size_mult < 1.0:
+            log.warning("Circuit breaker active — buy size mult=%.2f", size_mult)
         # Highest priority first, unique by exchange+side+action
         uniq: dict[str, OrderProposal] = {}
         for p in sorted(proposals, key=lambda x: x.priority, reverse=True):
@@ -76,6 +81,8 @@ class Executor:
         for p in uniq.values():
             qty = p.quantity
             if p.action == "buy":
+                if size_mult < 1.0:
+                    qty = max(0, int(qty * size_mult))
                 title = p.market_title or ""
                 basket = basket_from_title(title)
                 qty = cap_buy_quantity(
@@ -84,15 +91,15 @@ class Executor:
                     race_key=p.race_key or p.exchange_id,
                     bankroll=self.bankroll,
                     exposure=exposure,
-                    max_race_frac=self.cfg.max_race_exposure_frac,
-                    max_position_frac=self.cfg.max_position_frac,
+                    max_race_frac=self.cfg.max_race_exposure_frac * size_mult,
+                    max_position_frac=self.cfg.max_position_frac * size_mult,
                     basket=basket,
                     basket_exposure=basket_exp,
-                    max_basket_frac=basket_cap_frac(basket, self.cfg),
+                    max_basket_frac=basket_cap_frac(basket, self.cfg) * size_mult,
                 )
                 if qty <= 0:
                     log.info(
-                        "Skip buy (exposure/basket cap): %s race=%s basket=%s",
+                        "Skip buy (exposure/basket/circuit cap): %s race=%s basket=%s",
                         p.market_title[:50],
                         p.race_key,
                         basket,

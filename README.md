@@ -190,6 +190,7 @@ With sudo available: `sudo bash deploy/setup-server.sh` installs `pmcup-bots` + 
 - **Race exposure caps** — won't stack > `MAX_RACE_EXPOSURE_FRAC` of bankroll into one contest
 - **Basket caps** — House / Senate / Gov correlated exposure capped separately (`MAX_HOUSE_BASKET_FRAC`, etc.)
 - **Market blend** — low-confidence forecasts shrink toward the live mid (`BLEND_TOWARD_MARKET`)
+- **Circuit breaker** — if equity drops ≥20% from peak, new buys run at 50% size until recovery
 - **No live FLB** — heuristic trades without a fair_probs row stay paper-only unless `ALLOW_FLB_LIVE=true`
 - **Manual fair probs protected** — set `source=manual` or `locked=true` so auto-refresh won't overwrite
 - **API retries** + stable order idempotency keys

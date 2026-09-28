@@ -8,6 +8,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from .bots.runner import pid_path, status_path
+from .circuit_breaker import circuit_status
 from .client import SuperMarketClient
 from .config import settings
 from .equity import equity_series, load_equity_points, record_equity_point, render_equity_svg
@@ -142,6 +143,7 @@ def collect_snapshot() -> dict[str, Any]:
         "count": series.get("count"),
         "svg": render_equity_svg(series),
     }
+    snap["circuit_breaker"] = (snap.get("bot_status") or {}).get("circuit_breaker") or circuit_status()
     return snap
 
 
@@ -195,6 +197,7 @@ def render_html(data: dict[str, Any]) -> str:
     paper = data.get("paper") or {}
     window = data.get("trading_window") or {}
     equity = data.get("equity") or {}
+    breaker = data.get("circuit_breaker") or status.get("circuit_breaker") or {}
     mode = "LIVE" if data.get("live_trading") else "PAPER/DRY"
     mode_cls = "live" if data.get("live_trading") else "paper"
     stale = bool(data.get("bot_status_stale"))
@@ -288,6 +291,13 @@ def render_html(data: dict[str, Any]) -> str:
         banners.append(
             "<div class='banner warn'>Live latches are ON but outside the official "
             "trading window — orders stay paper.</div>"
+        )
+    if breaker.get("tripped"):
+        dd = breaker.get("drawdown")
+        dd_s = f"{float(dd):.0%}" if dd is not None else "—"
+        banners.append(
+            f"<div class='banner warn'>Circuit breaker TRIPPED (drawdown {dd_s} from peak). "
+            f"New buys at {float(breaker.get('size_mult') or 0.5):.0%} size.</div>"
         )
     err_html = "".join(banners)
 
@@ -506,7 +516,7 @@ def render_html(data: dict[str, Any]) -> str:
     <div class="stat mini-stat"><div class="label">Cycle</div><div class="value">{_esc(status.get('cycle', '—'))}</div></div>
     <div class="stat mini-stat"><div class="label">Exec / ok</div><div class="value">{_esc(status.get('executed', '—'))}/{_esc(status.get('ok', '—'))}</div></div>
     <div class="stat mini-stat"><div class="label">Paper PnL</div><div class="value">{_fmt_money(paper.get('total_pnl'))}</div></div>
-    <div class="stat mini-stat"><div class="label">Fail streak</div><div class="value">{_esc(status.get('fail_streak', 0))}</div></div>
+    <div class="stat mini-stat"><div class="label">Circuit</div><div class="value health {'bad' if breaker.get('tripped') else 'good'}">{'TRIP' if breaker.get('tripped') else 'OK'}</div></div>
   </div>
 
   <div class="chart-wrap">

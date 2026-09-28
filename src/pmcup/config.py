@@ -57,6 +57,10 @@ class Settings(BaseSettings):
     protect_manual_fair_probs: bool = True
     # Seconds before bot status is considered stale on the dashboard
     bot_status_stale_seconds: int = 600
+    # Peak-to-trough circuit breaker (Prevayo-style): cut new buy sizes on drawdown
+    circuit_breaker_enabled: bool = True
+    circuit_breaker_drawdown: float = 0.20  # trip at -20% from peak equity
+    circuit_breaker_size_mult: float = 0.50  # halve buys while tripped
 
     # Email alerts
     notify_on_stop: bool = True

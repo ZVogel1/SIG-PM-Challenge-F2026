@@ -10,6 +10,7 @@ from typing import Any
 
 from ..client import SuperMarketClient
 from ..config import Settings, settings
+from ..circuit_breaker import update_circuit_breaker
 from ..equity import record_equity_point
 from ..forecasts import update_fair_probs_from_forecasts
 from ..notify import notify_bots_stopped, notify_cycle_failures
@@ -88,6 +89,7 @@ def run_cycle(cfg: Settings, *, cycle: int = 0) -> dict[str, Any]:
         proposals.extend(proposals_from_constraints(ideas))
 
     positions: dict[str, Any] = {"positions": []}
+    breaker: dict[str, Any] = {"tripped": False, "size_mult": 1.0, "drawdown": 0.0}
     with SuperMarketClient(cfg) as client:
         if cfg.bot_enable_risk:
             try:
@@ -107,12 +109,48 @@ def run_cycle(cfg: Settings, *, cycle: int = 0) -> dict[str, Any]:
                 best_buy[key] = p
         merged = sells + list(best_buy.values())
 
+        # Equity for circuit breaker (cash + marks; paper uses bankroll+paper pnl)
+        paper_pre: dict[str, Any] = {}
+        try:
+            paper_pre = summarize_paper()
+        except Exception:  # noqa: BLE001
+            paper_pre = {}
+        acct = result.get("account") or {}
+        pos_summary = positions.get("summary") or {}
+        cash = acct.get("balance")
+        if cash is None:
+            cash = result.get("bankroll")
+        equity_now: float | None = None
+        try:
+            cash_f = float(cash) if cash is not None else None
+            mv_f = (
+                float(pos_summary["totalMarketValue"])
+                if pos_summary.get("totalMarketValue") is not None
+                else None
+            )
+            if cfg.can_trade_live:
+                if cash_f is not None and mv_f is not None:
+                    equity_now = cash_f + mv_f
+                elif cash_f is not None:
+                    equity_now = cash_f
+                elif mv_f is not None:
+                    equity_now = mv_f
+            else:
+                base = cash_f if cash_f is not None else 100_000.0
+                equity_now = base + float(paper_pre.get("total_pnl") or 0)
+        except Exception:  # noqa: BLE001
+            equity_now = float(result.get("bankroll") or 100_000)
+
+        breaker = update_circuit_breaker(equity_now, cfg)
+        size_mult = float(breaker.get("size_mult") or 1.0)
+
         executor = Executor(
             client,
             cfg,
             result["tournament_id"],
             bankroll=float(result.get("bankroll") or 100_000),
             positions_payload=positions,
+            size_mult=size_mult,
         )
         executed = executor.execute(merged)
 
@@ -170,6 +208,14 @@ def run_cycle(cfg: Settings, *, cycle: int = 0) -> dict[str, Any]:
             "missing_governor_ids": forecast_meta.get("missing_governor_ids"),
         },
         "paper": paper,
+        "circuit_breaker": {
+            "enabled": breaker.get("enabled", cfg.circuit_breaker_enabled),
+            "tripped": bool(breaker.get("tripped")),
+            "drawdown": breaker.get("drawdown"),
+            "size_mult": breaker.get("size_mult"),
+            "peak_equity": breaker.get("peak_equity"),
+            "last_equity": breaker.get("last_equity"),
+        },
         "top": [
             {
                 "bot": p.bot,
@@ -184,12 +230,13 @@ def run_cycle(cfg: Settings, *, cycle: int = 0) -> dict[str, Any]:
     }
     write_status(summary)
     log.info(
-        "Cycle %s done | live=%s proposals=%s executed=%s missing_forecasts=%s",
+        "Cycle %s done | live=%s proposals=%s executed=%s missing_forecasts=%s circuit=%s",
         cycle,
         cfg.can_trade_live,
         len(merged),
         len(executed),
         summary["missing_forecast_count"],
+        "TRIPPED" if breaker.get("tripped") else "ok",
     )
     return summary
 
