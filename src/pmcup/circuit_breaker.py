@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -49,6 +49,41 @@ def _save(state: dict[str, Any]) -> None:
     state_path().write_text(json.dumps(state, indent=2))
 
 
+def _rolling_peak(state: dict[str, Any], equity: float, cfg: Settings) -> float:
+    """
+    Peak equity over a trailing window.
+
+    An all-time peak means one early spike throttles buys for the rest of the
+    cup; a trailing window lets the reference drift back toward reality.
+    """
+    window_days = float(getattr(cfg, "circuit_breaker_peak_window_days", 0.0) or 0.0)
+    if window_days <= 0:
+        prev = state.get("peak_equity")
+        return max(equity, float(prev)) if prev is not None else equity
+
+    now = datetime.now(timezone.utc)
+    samples: list[list[Any]] = list(state.get("peak_samples") or [])
+
+    def _ts(raw: Any) -> datetime | None:
+        try:
+            return datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        except ValueError:
+            return None
+
+    last_ts = _ts(samples[-1][0]) if samples else None
+    if last_ts is None or (now - last_ts).total_seconds() >= 300:
+        samples.append([now.isoformat(), float(equity)])
+    else:
+        # Keep the high within the current bucket — a spike between samples
+        # still has to count as a peak.
+        samples[-1][1] = max(float(samples[-1][1]), float(equity))
+
+    cutoff = now - timedelta(days=window_days)
+    samples = [s for s in samples if (_ts(s[0]) or cutoff) >= cutoff]
+    state["peak_samples"] = samples[-2000:]
+    return max([float(s[1]) for s in samples] + [equity])
+
+
 def update_circuit_breaker(
     equity: float | None,
     cfg: Settings | None = None,
@@ -80,9 +115,7 @@ def update_circuit_breaker(
         _save(state)
         return state
 
-    peak = state.get("peak_equity")
-    if peak is None or equity > float(peak):
-        peak = float(equity)
+    peak = _rolling_peak(state, float(equity), cfg)
     state["peak_equity"] = float(peak)
     state["last_equity"] = float(equity)
 

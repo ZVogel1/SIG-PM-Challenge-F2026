@@ -67,6 +67,24 @@ class SuperMarketClient:
                         )
                         time.sleep(sleep_s)
                         continue
+                if response.is_error:
+                    detail = (response.text or "")[:300]
+                    if detail and response.status_code not in {
+                        408,
+                        425,
+                        429,
+                        500,
+                        502,
+                        503,
+                        504,
+                    }:
+                        # Surface API message on client errors (e.g. 400 insufficient funds)
+                        raise httpx.HTTPStatusError(
+                            f"{response.status_code} {response.reason_phrase} for "
+                            f"{response.request.url}: {detail}",
+                            request=response.request,
+                            response=response,
+                        )
                 response.raise_for_status()
                 return response.json()
             except Exception as exc:  # noqa: BLE001
@@ -213,6 +231,40 @@ class SuperMarketClient:
             period=period,
             limit=limit,
         )
+
+    def open_orders(
+        self,
+        *,
+        tournament_id: str | None = None,
+        limit: int = 100,
+        max_pages: int = 50,
+    ) -> list[dict[str, Any]]:
+        """Every resting (unfilled) order on the account."""
+        out: list[dict[str, Any]] = []
+        cursor: str | None = None
+        for _ in range(max_pages):
+            payload = self._get(
+                "/orders",
+                status="open",
+                limit=limit,
+                cursor=cursor,
+                tournamentId=tournament_id,
+            )
+            if isinstance(payload, list):
+                out.extend(payload)
+                break
+            data = payload.get("data") or []
+            out.extend(data)
+            pag = payload.get("pagination") or {}
+            if not pag.get("hasMore"):
+                break
+            cursor = pag.get("nextCursor")
+            if not cursor:
+                break
+        return out
+
+    def cancel_order(self, order_id: Any) -> dict[str, Any]:
+        return self._request("DELETE", f"/orders/{order_id}")
 
     def place_order(
         self,

@@ -1,6 +1,11 @@
 from __future__ import annotations
 
-from pmcup.portfolio import cap_buy_quantity, exposure_by_race
+from pmcup.portfolio import (
+    cap_buy_quantity,
+    cap_buy_to_cash,
+    cash_and_equity,
+    exposure_by_race,
+)
 
 
 def test_exposure_by_race_sums_mirrors() -> None:
@@ -48,3 +53,17 @@ def test_cap_buy_quantity_zero_when_full() -> None:
         max_position_frac=0.25,
     )
     assert qty == 0
+
+
+def test_cash_and_equity_uses_marks() -> None:
+    cash, equity = cash_and_equity(
+        {"balance": 40_000},
+        {"summary": {"totalMarketValue": 90_000}},
+    )
+    assert cash == 40_000
+    assert equity == 130_000
+
+
+def test_cap_buy_to_cash() -> None:
+    assert cap_buy_to_cash(10_000, 0.5, 100) == 200
+    assert cap_buy_to_cash(10, 0.5, 0) == 0

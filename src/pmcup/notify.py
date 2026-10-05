@@ -2,11 +2,16 @@ from __future__ import annotations
 
 import logging
 import smtplib
+import time
 from email.message import EmailMessage
+from pathlib import Path
 
 from .config import Settings, settings
 
 log = logging.getLogger("pmcup.notify")
+
+_ORDER_FAIL_NOTIFY_COOLDOWN_S = 1800  # 30 minutes
+_ORDER_FAIL_STAMP = Path("data/bots/last_order_fail_notify.ts")
 
 
 def email_configured(cfg: Settings | None = None) -> bool:
@@ -98,6 +103,24 @@ def notify_order_failures(failures: list[str]) -> None:
     cfg = settings
     if not cfg.notify_on_errors or not failures:
         return
+    # Rate-limit: single rejected orders every cycle were flooding email
+    try:
+        _ORDER_FAIL_STAMP.parent.mkdir(parents=True, exist_ok=True)
+        if _ORDER_FAIL_STAMP.exists():
+            age = time.time() - _ORDER_FAIL_STAMP.stat().st_mtime
+            if age < _ORDER_FAIL_NOTIFY_COOLDOWN_S:
+                log.info(
+                    "Skipping order-failure email (cooldown %.0fs left, %s fails)",
+                    _ORDER_FAIL_NOTIFY_COOLDOWN_S - age,
+                    len(failures),
+                )
+                return
+    except Exception:  # noqa: BLE001
+        log.exception("Order-fail notify cooldown check failed")
     subject = f"[Predictions Cup] {len(failures)} order failure(s)"
     body = "Some bot orders failed this cycle:\n\n" + "\n".join(f"- {f}" for f in failures[:20])
-    send_email(subject, body, cfg=cfg, force=True)
+    if send_email(subject, body, cfg=cfg, force=True):
+        try:
+            _ORDER_FAIL_STAMP.write_text(str(time.time()))
+        except Exception:  # noqa: BLE001
+            pass

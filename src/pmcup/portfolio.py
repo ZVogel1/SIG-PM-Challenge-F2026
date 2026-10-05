@@ -48,6 +48,57 @@ def total_exposure(positions_payload: dict[str, Any]) -> float:
     return sum(exposure_by_race(positions_payload).values())
 
 
+def cash_and_equity(
+    account: dict[str, Any] | None,
+    positions_payload: dict[str, Any] | None,
+    *,
+    fallback: float = 100_000.0,
+) -> tuple[float, float]:
+    """
+    Return (cash, equity) for sizing/caps.
+
+    Tournament myBalance / account.balance is usually *cash*. Caps and Kelly
+    should use equity (cash + marked positions) or the bot starves itself as
+    soon as capital is deployed.
+    """
+    acct = account or {}
+    pos = positions_payload or {}
+    summary = pos.get("summary") or {}
+
+    cash_raw = acct.get("balance")
+    if cash_raw is None:
+        cash_raw = acct.get("availableBalance")
+    try:
+        cash = float(cash_raw) if cash_raw is not None else None
+    except (TypeError, ValueError):
+        cash = None
+
+    try:
+        mv = (
+            float(summary["totalMarketValue"])
+            if summary.get("totalMarketValue") is not None
+            else None
+        )
+    except (TypeError, ValueError):
+        mv = None
+
+    if cash is None and mv is None:
+        return fallback, fallback
+    if cash is None:
+        return 0.0, float(mv)
+    if mv is None:
+        return cash, cash
+    return cash, cash + mv
+
+
+def cap_buy_to_cash(quantity: int, price: float | None, cash: float) -> int:
+    """Shrink a buy so notional fits available cash."""
+    if quantity <= 0 or cash <= 0:
+        return 0
+    px = float(price) if price is not None and price > 0 else 0.5
+    return max(0, min(quantity, int(cash // px)))
+
+
 def basket_cap_frac(basket: str, cfg: Any) -> float:
     """Max bankroll fraction allowed in a correlated basket."""
     mapping = {

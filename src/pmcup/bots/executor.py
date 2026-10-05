@@ -15,6 +15,7 @@ from ..paper_scoreboard import record_paper_fills
 from ..portfolio import (
     basket_cap_frac,
     cap_buy_quantity,
+    cap_buy_to_cash,
     exposure_by_basket,
     exposure_by_race,
 )
@@ -31,10 +32,9 @@ def bots_dir() -> Path:
     return path
 
 
-def _stable_idempotency(p: OrderProposal, tournament_id: str) -> str:
+def _stable_idempotency(p: OrderProposal, tournament_id: str, *, window_s: int = 120) -> str:
     """Stable key within a short window so HTTP retries don't double-submit."""
-    # Bucket to ~2 minutes so intentional re-quotes later still get a new key
-    bucket = int(datetime.now(timezone.utc).timestamp() // 120)
+    bucket = int(datetime.now(timezone.utc).timestamp() // max(1, window_s))
     raw = (
         f"{tournament_id}|{p.exchange_id}|{p.side}|{p.action}|"
         f"{p.quantity}|{p.price}|{bucket}|{p.bot}"
@@ -54,6 +54,7 @@ class Executor:
         bankroll: float = 100_000.0,
         positions_payload: dict[str, Any] | None = None,
         size_mult: float = 1.0,
+        cash_available: float | None = None,
     ) -> None:
         self.client = client
         self.cfg = cfg
@@ -61,7 +62,74 @@ class Executor:
         self.bankroll = bankroll
         self.positions_payload = positions_payload or {"positions": []}
         self.size_mult = max(0.0, min(1.0, float(size_mult)))
+        self.cash_available = (
+            float(cash_available) if cash_available is not None else float(bankroll)
+        )
         self.decisions_path = bots_dir() / "decisions.jsonl"
+
+    def _held_quantity(self) -> dict[str, float]:
+        out: dict[str, float] = {}
+        for pos in self.positions_payload.get("positions") or []:
+            if pos.get("settled"):
+                continue
+            out[str(pos.get("exchangeId"))] = abs(float(pos.get("quantity") or 0))
+        return out
+
+    def _cancel_stale_orders(self, orders: list[dict[str, Any]]) -> set[Any]:
+        """Cancel resting limits older than order_stale_seconds."""
+        stale_after = int(self.cfg.order_stale_seconds)
+        if stale_after <= 0:
+            return set()
+        now = datetime.now(timezone.utc)
+        canceled: set[Any] = set()
+        for order in orders:
+            if len(canceled) >= int(self.cfg.max_cancels_per_cycle):
+                break
+            created = order.get("createdAt")
+            if not created:
+                continue
+            try:
+                ts = datetime.fromisoformat(str(created).replace("Z", "+00:00"))
+            except ValueError:
+                continue
+            if (now - ts).total_seconds() < stale_after:
+                continue
+            try:
+                self.client.cancel_order(order.get("id"))
+                canceled.add(order.get("id"))
+            except Exception:  # noqa: BLE001
+                log.warning("Could not cancel stale order %s", order.get("id"))
+        if canceled:
+            log.info("Canceled %s stale resting order(s)", len(canceled))
+        return canceled
+
+    def _marketable_price(self, exchange_id: str, side: str, action: str) -> float | None:
+        """
+        Price that should actually trade, taken from the live book.
+
+        The book is quoted in YES terms, so NO orders need the complement.
+        """
+        try:
+            book = self.client.orderbook(exchange_id, depth=1)
+        except Exception:  # noqa: BLE001
+            return None
+        bid = book.get("bestBid")
+        ask = book.get("bestAsk")
+        try:
+            bid = float(bid) if bid is not None else None
+            ask = float(ask) if ask is not None else None
+        except (TypeError, ValueError):
+            return None
+        if side == "yes":
+            px = bid if action == "sell" else ask
+        else:
+            # NO sells hit the NO bid (1 - YES ask); NO buys lift the NO ask.
+            px = (1.0 - ask) if (action == "sell" and ask is not None) else (
+                (1.0 - bid) if bid is not None else None
+            )
+        if px is None or px <= 0:
+            return None
+        return round_tick(px)
 
     def execute(self, proposals: list[OrderProposal]) -> list[dict[str, Any]]:
         exposure = exposure_by_race(self.positions_payload)
@@ -69,6 +137,28 @@ class Executor:
         size_mult = self.size_mult
         if size_mult < 1.0:
             log.warning("Circuit breaker active — buy size mult=%.2f", size_mult)
+
+        # Resting orders: cancel stale ones, then never stack a duplicate on top
+        resting: dict[tuple[str, str, str], int] = {}
+        if self.cfg.can_trade_live:
+            try:
+                open_orders = self.client.open_orders(tournament_id=self.tournament_id)
+            except Exception:  # noqa: BLE001
+                log.exception("Could not load open orders")
+                open_orders = []
+            canceled = self._cancel_stale_orders(open_orders)
+            for order in open_orders:
+                if order.get("id") in canceled:
+                    continue
+                key = (
+                    str(order.get("exchangeId")),
+                    str(order.get("side")),
+                    str(order.get("action")),
+                )
+                resting[key] = resting.get(key, 0) + int(order.get("quantity") or 0)
+            if resting:
+                log.info("Resting orders after cleanup: %s", len(resting))
+        held = self._held_quantity()
         # Highest priority first, unique by exchange+side+action
         uniq: dict[str, OrderProposal] = {}
         for p in sorted(proposals, key=lambda x: x.priority, reverse=True):
@@ -77,10 +167,36 @@ class Executor:
             if p.key not in uniq:
                 uniq[p.key] = p
 
+        ordered = sorted(
+            uniq.values(),
+            key=lambda x: (0 if x.action == "sell" else 1, -x.priority),
+        )
+        # Use real cash only — limit sells often rest unfilled, so don't
+        # pretendsell proceeds are spendable in the same cycle.
+        working_cash = float(self.cash_available)
         adjusted: list[OrderProposal] = []
-        for p in uniq.values():
+        for p in ordered:
             qty = p.quantity
-            if p.action == "buy":
+            resting_key = (str(p.exchange_id), str(p.side), str(p.action))
+            resting_qty = resting.get(resting_key, 0)
+            if resting_qty > 0:
+                log.info(
+                    "Skip %s — %s already resting on %s",
+                    p.action,
+                    resting_qty,
+                    p.market_title[:50],
+                )
+                continue
+            if p.action == "sell":
+                # Never offer more than we actually hold
+                held_qty = int(held.get(str(p.exchange_id), 0))
+                if held_qty <= 0:
+                    log.info("Skip sell — no position: %s", p.market_title[:50])
+                    continue
+                qty = min(qty, held_qty)
+                if qty <= 0:
+                    continue
+            elif p.action == "buy":
                 if size_mult < 1.0:
                     qty = max(0, int(qty * size_mult))
                 title = p.market_title or ""
@@ -97,23 +213,34 @@ class Executor:
                     basket_exposure=basket_exp,
                     max_basket_frac=basket_cap_frac(basket, self.cfg) * size_mult,
                 )
+                cash_qty = cap_buy_to_cash(qty, p.price, working_cash)
+                if cash_qty < qty:
+                    log.info(
+                        "Shrink buy to cash: %s %s→%s (cash=%.0f)",
+                        p.market_title[:50],
+                        qty,
+                        cash_qty,
+                        working_cash,
+                    )
+                    qty = cash_qty
                 if qty <= 0:
                     log.info(
-                        "Skip buy (exposure/basket/circuit cap): %s race=%s basket=%s",
+                        "Skip buy (exposure/basket/circuit/cash cap): %s race=%s basket=%s",
                         p.market_title[:50],
                         p.race_key,
                         basket,
                     )
                     continue
-                # Reserve room for later proposals in this same cycle
                 px = float(p.price) if p.price is not None and p.price > 0 else 0.5
                 key = p.race_key or p.exchange_id
                 notional = qty * px
                 exposure[key] = exposure.get(key, 0.0) + notional
                 basket_exp[basket] = basket_exp.get(basket, 0.0) + notional
+                working_cash = max(0.0, working_cash - notional)
             if qty != p.quantity:
                 p = OrderProposal(**{**p.__dict__, "quantity": qty})
             adjusted.append(p)
+            resting[resting_key] = resting.get(resting_key, 0) + qty
 
         chosen = adjusted[: self.cfg.bot_max_orders_per_cycle]
         results: list[dict[str, Any]] = []
@@ -126,7 +253,29 @@ class Executor:
 
         failures: list[str] = []
         for p in chosen:
-            price = None if p.price is None else round_tick(p.price)
+            # Price off the live book so limits actually trade instead of resting
+            price = self._marketable_price(p.exchange_id, p.side, p.action)
+            if price is None:
+                price = None if p.price is None else round_tick(float(p.price))
+            if p.action == "buy":
+                # Never trust optimistic sell proceeds — refresh live cash
+                if live:
+                    try:
+                        bal = self.client.account().get("balance")
+                        if bal is not None:
+                            self.cash_available = float(bal)
+                    except Exception:  # noqa: BLE001
+                        log.exception("Could not refresh cash before buy")
+                qty = cap_buy_to_cash(p.quantity, price, self.cash_available)
+                if qty <= 0:
+                    log.info(
+                        "Skip buy after cash check: %s (cash=%.0f)",
+                        p.market_title[:50],
+                        self.cash_available,
+                    )
+                    continue
+                if qty != p.quantity:
+                    p = OrderProposal(**{**p.__dict__, "quantity": qty})
             try:
                 resp = self.client.place_order(
                     exchange_id=p.exchange_id,
@@ -135,7 +284,11 @@ class Executor:
                     quantity=p.quantity,
                     price=price,
                     tournament_id=self.tournament_id,
-                    idempotency_key=_stable_idempotency(p, self.tournament_id),
+                    idempotency_key=_stable_idempotency(
+                        p,
+                        self.tournament_id,
+                        window_s=max(120, int(self.cfg.bot_interval_seconds) * 2),
+                    ),
                     dry_run=not live,
                 )
                 row = {
@@ -152,6 +305,12 @@ class Executor:
                     "response": resp,
                     "ok": True,
                 }
+                # Do not credit sell notionals here — unfilled limits leave cash at 0
+                if p.action == "buy":
+                    px = float(price) if price is not None and price > 0 else 0.5
+                    self.cash_available = max(
+                        0.0, self.cash_available - float(p.quantity) * px
+                    )
             except Exception as exc:  # noqa: BLE001
                 row = {
                     "ts": datetime.now(timezone.utc).isoformat(),

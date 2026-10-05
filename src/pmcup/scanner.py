@@ -8,6 +8,7 @@ from .constraints import ideas_from_constraints
 from .edge import dedupe_complement_markets, edge_from_fair, edge_from_flb
 from .fair_probs import load_fair_probs
 from .models import Quote, TradeIdea
+from .portfolio import cash_and_equity
 
 
 def _resolve_tournament(client: SuperMarketClient, cfg: Settings) -> tuple[str, str, float]:
@@ -82,7 +83,19 @@ def _num(v: Any) -> float | None:
 def scan(cfg: Settings | None = None) -> dict[str, Any]:
     cfg = cfg or settings
     with SuperMarketClient(cfg) as client:
-        slug, tournament_id, bankroll = _resolve_tournament(client, cfg)
+        slug, tournament_id, listed_balance = _resolve_tournament(client, cfg)
+        account = client.account()
+        positions: dict[str, Any] = {"positions": []}
+        try:
+            positions = client.positions(slug)
+        except Exception:  # noqa: BLE001
+            positions = {"positions": []}
+
+        # Size/caps off equity (cash + marks), not cash alone — otherwise the
+        # bot locks itself out after deploying into positions.
+        cash, equity = cash_and_equity(account, positions, fallback=listed_balance)
+        bankroll = max(equity, listed_balance, cash)
+
         markets = client.list_tournament_markets(slug, status="open")
         if not markets:
             markets = client.list_markets(tournament_id=tournament_id, status="open")
@@ -151,7 +164,6 @@ def scan(cfg: Settings | None = None) -> dict[str, Any]:
 
         ranked = dedupe_complement_markets(ideas)
 
-        account = client.account()
         try:
             board = client.leaderboard(slug, period="all", limit=10)
         except Exception:  # noqa: BLE001
@@ -161,6 +173,9 @@ def scan(cfg: Settings | None = None) -> dict[str, Any]:
             "slug": slug,
             "tournament_id": tournament_id,
             "bankroll": bankroll,
+            "cash": cash,
+            "equity": equity,
+            "positions": positions,
             "market_count": len(markets),
             "quote_count": len(quotes),
             "fair_prob_count": len(fair),

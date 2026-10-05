@@ -16,10 +16,11 @@ from ..forecasts import update_fair_probs_from_forecasts
 from ..notify import notify_bots_stopped, notify_cycle_failures
 from ..paper_scoreboard import summarize_paper
 from ..research import snapshot_scan
+from ..portfolio import cash_and_equity
 from ..scanner import scan
 from ..trading_window import window_status
 from .executor import Executor, bots_dir
-from .risk import risk_exit_proposals
+from .risk import cash_buffer_proposals, risk_exit_proposals
 from .strategies import proposals_from_constraints, proposals_from_edge_ideas
 from .types import OrderProposal
 
@@ -88,16 +89,47 @@ def run_cycle(cfg: Settings, *, cycle: int = 0) -> dict[str, Any]:
     if cfg.bot_enable_constraint:
         proposals.extend(proposals_from_constraints(ideas))
 
-    positions: dict[str, Any] = {"positions": []}
+    # Prefer positions already fetched in scan (avoids a duplicate API call)
+    positions: dict[str, Any] = result.get("positions") or {"positions": []}
     breaker: dict[str, Any] = {"tripped": False, "size_mult": 1.0, "drawdown": 0.0}
     with SuperMarketClient(cfg) as client:
-        if cfg.bot_enable_risk:
+        if not (positions.get("positions") or positions.get("summary")):
             try:
                 positions = client.positions(result["slug"])
             except Exception:  # noqa: BLE001
                 log.exception("Could not load positions")
                 positions = {"positions": []}
+        # Equity / cash first — risk + cash-buffer sells need them
+        paper_pre: dict[str, Any] = {}
+        try:
+            paper_pre = summarize_paper()
+        except Exception:  # noqa: BLE001
+            paper_pre = {}
+        acct = result.get("account") or {}
+        cash_f, equity_from_pos = cash_and_equity(
+            acct, positions, fallback=float(result.get("bankroll") or 100_000)
+        )
+        if result.get("cash") is not None:
+            try:
+                cash_f = float(result["cash"])
+            except (TypeError, ValueError):
+                pass
+        equity_now: float | None
+        if cfg.can_trade_live:
+            equity_now = float(result.get("equity") or equity_from_pos)
+        else:
+            equity_now = cash_f + float(paper_pre.get("total_pnl") or 0)
+
+        if cfg.bot_enable_risk:
             proposals.extend(risk_exit_proposals(positions, ideas, cfg))
+            proposals.extend(
+                cash_buffer_proposals(
+                    positions,
+                    cash=cash_f,
+                    equity=float(equity_now or 0),
+                    cfg=cfg,
+                )
+            )
 
         buys = [p for p in proposals if p.action == "buy"]
         sells = [p for p in proposals if p.action == "sell"]
@@ -107,39 +139,32 @@ def run_cycle(cfg: Settings, *, cycle: int = 0) -> dict[str, Any]:
             prev = best_buy.get(key)
             if prev is None or p.priority > prev.priority:
                 best_buy[key] = p
-        merged = sells + list(best_buy.values())
+        # Tiny leftover trims shouldn't eat the order budget
+        meaningful_sells = [p for p in sells if p.quantity >= 25]
+        # When cash is below target, sell first so same-cycle buys can reuse cash
+        target_frac = float(getattr(cfg, "target_cash_frac", 0.0) or 0.0)
+        cash_short = (
+            target_frac > 0
+            and float(equity_now or 0) > 0
+            and cash_f < float(equity_now or 0) * target_frac
+        )
+        if cash_short:
+            merged = meaningful_sells + list(best_buy.values())
+        else:
+            merged = list(best_buy.values()) + meaningful_sells
 
-        # Equity for circuit breaker (cash + marks; paper uses bankroll+paper pnl)
-        paper_pre: dict[str, Any] = {}
-        try:
-            paper_pre = summarize_paper()
-        except Exception:  # noqa: BLE001
-            paper_pre = {}
-        acct = result.get("account") or {}
-        pos_summary = positions.get("summary") or {}
-        cash = acct.get("balance")
-        if cash is None:
-            cash = result.get("bankroll")
-        equity_now: float | None = None
-        try:
-            cash_f = float(cash) if cash is not None else None
-            mv_f = (
-                float(pos_summary["totalMarketValue"])
-                if pos_summary.get("totalMarketValue") is not None
-                else None
-            )
-            if cfg.can_trade_live:
-                if cash_f is not None and mv_f is not None:
-                    equity_now = cash_f + mv_f
-                elif cash_f is not None:
-                    equity_now = cash_f
-                elif mv_f is not None:
-                    equity_now = mv_f
-            else:
-                base = cash_f if cash_f is not None else 100_000.0
-                equity_now = base + float(paper_pre.get("total_pnl") or 0)
-        except Exception:  # noqa: BLE001
-            equity_now = float(result.get("bankroll") or 100_000)
+        sizing_bankroll = max(
+            float(result.get("bankroll") or 0),
+            float(equity_now or 0),
+            cash_f,
+        )
+        log.info(
+            "Sizing bankroll=%.0f cash=%.0f equity=%.0f cash_short=%s",
+            sizing_bankroll,
+            cash_f,
+            float(equity_now or 0),
+            cash_short,
+        )
 
         breaker = update_circuit_breaker(equity_now, cfg)
         size_mult = float(breaker.get("size_mult") or 1.0)
@@ -148,9 +173,10 @@ def run_cycle(cfg: Settings, *, cycle: int = 0) -> dict[str, Any]:
             client,
             cfg,
             result["tournament_id"],
-            bankroll=float(result.get("bankroll") or 100_000),
+            bankroll=sizing_bankroll,
             positions_payload=positions,
             size_mult=size_mult,
+            cash_available=cash_f,
         )
         executed = executor.execute(merged)
 
@@ -200,6 +226,9 @@ def run_cycle(cfg: Settings, *, cycle: int = 0) -> dict[str, Any]:
         "executed": len(executed),
         "ok": sum(1 for r in executed if r.get("ok")),
         "fail": sum(1 for r in executed if not r.get("ok")),
+        "sizing_bankroll": sizing_bankroll,
+        "cash": cash_f,
+        "equity": equity_now,
         "missing_forecasts": result.get("missing_forecasts") or [],
         "missing_forecast_count": len(result.get("missing_forecasts") or []),
         "forecast_refresh": {

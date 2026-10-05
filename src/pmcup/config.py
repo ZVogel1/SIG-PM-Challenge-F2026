@@ -47,6 +47,8 @@ class Settings(BaseSettings):
     bot_take_profit_frac: float = 0.35  # sell if uPnL% exceeds this (paper/live)
     # Underwater trim when no scan idea exists for the position
     bot_underwater_exit_frac: float = -0.20
+    # Keep dry powder for new edges (0 = allow full deploy)
+    target_cash_frac: float = 0.12
     # Keep running after failures (systemd/watchdog restart). Notify after N fails.
     bot_fail_notify_streak: int = 3
     bot_fail_backoff_s: int = 60
@@ -61,6 +63,13 @@ class Settings(BaseSettings):
     circuit_breaker_enabled: bool = True
     circuit_breaker_drawdown: float = 0.20  # trip at -20% from peak equity
     circuit_breaker_size_mult: float = 0.50  # halve buys while tripped
+    # Measure the peak over a trailing window so one early spike doesn't
+    # throttle buys for the rest of the cup. 0 = all-time peak.
+    circuit_breaker_peak_window_days: float = 3.0
+
+    # Resting-order hygiene: cancel unfilled limits and never stack duplicates
+    order_stale_seconds: int = 600
+    max_cancels_per_cycle: int = 40
 
     # Email alerts
     notify_on_stop: bool = True
