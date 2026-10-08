@@ -7,6 +7,10 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 mkdir -p data/bots
 
+# Record our own pid. Without this the pidfile keeps whatever the last launcher
+# wrote, so a status check cannot tell a live keeper from a dead one.
+echo $$ > data/bots/watchdog.pid
+
 # shellcheck disable=SC1091
 source "$ROOT/.venv/bin/activate"
 export PYTHONPATH="$ROOT/src"

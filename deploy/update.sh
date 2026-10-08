@@ -7,10 +7,22 @@
 #   ./deploy/update.sh --check  # report drift, change nothing
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+ROOT="${PMCUP_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
+
+# bash reads a script lazily, by byte offset, so the `git reset` below would
+# make a changed update.sh resume mid-deploy at the wrong position. Run from a
+# throwaway copy that git cannot touch. Unlinking at exit is safe on Linux
+# because the interpreter already holds the descriptor.
+if [[ "${PMCUP_DEPLOY_REEXEC:-}" != "1" ]]; then
+  self="$(mktemp -t pmcup_update.XXXXXX)"
+  cp "$0" "$self"
+  chmod +x "$self"
+  PMCUP_DEPLOY_REEXEC=1 PMCUP_ROOT="$ROOT" exec "$self" "$@"
+fi
+trap 'rm -f "$0"' EXIT
+
 cd "$ROOT"
 BRANCH="${BRANCH:-main}"
-
 git fetch origin "$BRANCH"
 
 if [[ "${1:-}" == "--check" ]]; then
@@ -66,5 +78,17 @@ for name in runner guard dashboard; do
     kill "$pid" && echo "stopped $name ($pid)"
   fi
 done
+
+# Same byte-offset hazard as above: a rewritten watchdog.sh cannot be left to
+# keep running. Replace it last, so the new keeper brings the workers back.
+if ! git diff --quiet "$OLD" "$NEW" -- deploy/watchdog.sh; then
+  wpid="$(cat data/bots/watchdog.pid 2>/dev/null || true)"
+  [[ -n "$wpid" ]] && kill "$wpid" 2>/dev/null || true
+  pkill -f "[w]atchdog.sh" 2>/dev/null || true
+  sleep 2
+  setsid "$ROOT/deploy/watchdog.sh" </dev/null >> "$ROOT/data/bots/watchdog.out" 2>&1 &
+  disown || true
+  echo "restarted watchdog (its script changed)"
+fi
 
 echo "deployed ${OLD:0:7} -> ${NEW:0:7}; watchdog restarts workers within 60s"
