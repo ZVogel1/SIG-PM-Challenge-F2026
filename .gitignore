@@ -1,4 +1,7 @@
 .env
+# Timestamped .env backups on the VM hold a live API key and SMTP password
+.env.*
+!.env.example
 .venv/
 venv/
 __pycache__/
