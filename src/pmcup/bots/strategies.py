@@ -16,10 +16,12 @@ def proposals_from_edge_ideas(
     ideas: list[TradeIdea],
     *,
     bot: str = "edge_hunter",
-    max_ideas: int = 8,
+    max_ideas: int | None = None,
     cfg: Settings | None = None,
 ) -> list[OrderProposal]:
     cfg = cfg or settings
+    if max_ideas is None:
+        max_ideas = int(cfg.bot_max_edge_ideas)
     allow_flb = _flb_allowed(cfg)
     out: list[OrderProposal] = []
     for idea in ideas:

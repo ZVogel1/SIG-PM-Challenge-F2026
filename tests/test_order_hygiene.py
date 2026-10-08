@@ -24,8 +24,10 @@ class FakeClient:
         self.canceled.append(order_id)
         return {"orderId": order_id}
 
+    book: dict[str, Any] = {"bestBid": 0.695, "bestAsk": 0.70}
+
     def orderbook(self, exchange_id: str, **_: Any) -> dict[str, Any]:
-        return {"bestBid": 0.695, "bestAsk": 0.70}
+        return self.book
 
     def account(self) -> dict[str, Any]:
         return {"balance": 50_000}
@@ -52,6 +54,9 @@ def _positions() -> dict[str, Any]:
             {
                 "exchangeId": "1066",
                 "marketTitle": "Will the Democratic Party win the Alaska Senate?",
+                # API always reports option YES; a negative quantity is the NO side
+                "option": "YES",
+                "settled": False,
                 "quantity": -21326,
                 "currentPrice": 0.693,
             }
@@ -138,3 +143,54 @@ def test_no_sell_priced_off_book_complement() -> None:
     ex.execute([_sell()])
     # NO sell hits the NO bid = 1 - best YES ask = 0.30
     assert client.placed[0]["price"] == 0.30
+
+
+def test_short_position_counts_as_no_side_holding() -> None:
+    client = FakeClient()
+    ex = Executor(client, _cfg(), "t1", positions_payload=_positions(), cash_available=0.0)
+    ex.execute([_sell(qty=2_000)])
+    assert client.placed and client.placed[0]["side"] == "no"
+    assert client.placed[0]["quantity"] == 2_000
+
+
+def test_yes_sell_not_covered_by_no_position() -> None:
+    client = FakeClient()
+    ex = Executor(client, _cfg(), "t1", positions_payload=_positions(), cash_available=0.0)
+    yes_sell = OrderProposal(**{**_sell().__dict__, "side": "yes"})
+    ex.execute([yes_sell])
+    assert client.placed == []
+
+
+def test_cycle_aborts_when_open_orders_unreadable() -> None:
+    class Blind(FakeClient):
+        def open_orders(self, **_: Any) -> list[dict[str, Any]]:
+            raise RuntimeError("API down")
+
+    client = Blind()
+    ex = Executor(client, _cfg(), "t1", positions_payload=_positions(), cash_available=0.0)
+    assert ex.execute([_sell()]) == []
+    assert client.placed == []
+
+
+def test_buy_never_pays_above_its_own_limit() -> None:
+    client = FakeClient()
+    client.book = {"bestBid": 0.69, "bestAsk": 0.90}
+    buy = OrderProposal(**{**_sell().__dict__, "action": "buy", "side": "yes", "price": 0.60})
+    ex = Executor(client, _cfg(), "t1", positions_payload=_positions(), cash_available=100_000.0)
+    ex.execute([buy])
+    assert client.placed[0]["price"] == 0.60
+    # A cheaper ask is taken instead of our limit
+    client.placed.clear()
+    client.book = {"bestBid": 0.40, "bestAsk": 0.45}
+    ex = Executor(client, _cfg(), "t1", positions_payload=_positions(), cash_available=100_000.0)
+    ex.execute([buy])
+    assert client.placed[0]["price"] == 0.45
+
+
+def test_sell_skipped_when_bid_far_below_target() -> None:
+    client = FakeClient()
+    # NO bid = 1 - 0.95 = 0.05 against a 0.30 target
+    client.book = {"bestBid": 0.90, "bestAsk": 0.95}
+    ex = Executor(client, _cfg(), "t1", positions_payload=_positions(), cash_available=0.0)
+    ex.execute([_sell()])
+    assert client.placed == []

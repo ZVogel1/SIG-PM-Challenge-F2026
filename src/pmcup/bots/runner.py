@@ -21,6 +21,14 @@ from ..scanner import scan
 from ..trading_window import window_status
 from .executor import Executor, bots_dir
 from .risk import cash_buffer_proposals, risk_exit_proposals
+from .rotation import (
+    record_fills as record_rotation_fills,
+    filter_buys as filter_rotation_buys,
+    load_state as load_rotation_state,
+    prune as prune_rotation,
+    rotation_proposals,
+    save_state as save_rotation_state,
+)
 from .strategies import proposals_from_constraints, proposals_from_edge_ideas
 from .types import OrderProposal
 
@@ -120,16 +128,29 @@ def run_cycle(cfg: Settings, *, cycle: int = 0) -> dict[str, Any]:
         else:
             equity_now = cash_f + float(paper_pre.get("total_pnl") or 0)
 
+        rotation_state = prune_rotation(load_rotation_state())
         if cfg.bot_enable_risk:
             proposals.extend(risk_exit_proposals(positions, ideas, cfg))
-            proposals.extend(
-                cash_buffer_proposals(
-                    positions,
-                    cash=cash_f,
-                    equity=float(equity_now or 0),
-                    cfg=cfg,
+            if float(getattr(cfg, "target_cash_frac", 0.0) or 0.0) > 0:
+                proposals.extend(
+                    cash_buffer_proposals(
+                        positions,
+                        cash=cash_f,
+                        equity=float(equity_now or 0),
+                        cfg=cfg,
+                    )
                 )
+            rotations, rotation_state = rotation_proposals(
+                positions,
+                ideas,
+                cfg,
+                equity=float(equity_now or 0),
+                state=rotation_state,
             )
+            proposals.extend(rotations)
+
+        # Cooldowns and earmarks: never buy back what we just sold
+        proposals = filter_rotation_buys(proposals, cfg, state=rotation_state)
 
         buys = [p for p in proposals if p.action == "buy"]
         sells = [p for p in proposals if p.action == "sell"]
@@ -179,6 +200,13 @@ def run_cycle(cfg: Settings, *, cycle: int = 0) -> dict[str, Any]:
             cash_available=cash_f,
         )
         executed = executor.execute(merged)
+
+        # Lock out re-entry on anything we just sold, and retire filled earmarks
+        try:
+            rotation_state = record_rotation_fills(executed, cfg, state=rotation_state)
+            save_rotation_state(rotation_state)
+        except Exception:  # noqa: BLE001
+            log.exception("Could not persist rotation state")
 
     try:
         snapshot_scan(result)

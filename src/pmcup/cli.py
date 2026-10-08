@@ -240,6 +240,29 @@ def dashboard_cmd(
     serve(host=host, port=port)
 
 
+@app.command("guard")
+def guard_cmd(
+    once: bool = typer.Option(False, help="Run a single pass and print findings, then exit"),
+) -> None:
+    """
+    Watch for the failure shapes that don't raise errors, and email on them.
+
+    Covers churn (a market re-bought after being sold), runaway order rates,
+    resting-order pile-ups, equity drawdown, a stalled cycle loop, and rotation
+    exceeding its daily cap.
+    """
+    from .guard import run_once, watch
+
+    if once:
+        sent = run_once()
+        if not sent:
+            console.print("[green]Nothing new to report.[/green]")
+        for a in sent:
+            console.print(Panel.fit(a.detail, title=a.title))
+        return
+    watch()
+
+
 @app.command("setup")
 def setup_cmd() -> None:
     """Create local folders and example fair-probability sheet."""

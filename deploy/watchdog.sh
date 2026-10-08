@@ -30,11 +30,23 @@ start_dashboard() {
   echo "$(date -u +%FT%TZ) started dashboard pid=$(cat data/bots/dashboard.pid)" >> data/bots/watchdog.log
 }
 
+# Separate process on purpose: if the bots wedge, this is what reports it.
+start_guard() {
+  if [[ -f data/bots/guard.pid ]] && kill -0 "$(cat data/bots/guard.pid)" 2>/dev/null; then
+    return 0
+  fi
+  nohup python -m pmcup guard >> data/bots/guard.log 2>&1 &
+  echo $! > data/bots/guard.pid
+  echo "$(date -u +%FT%TZ) started guard pid=$(cat data/bots/guard.pid)" >> data/bots/watchdog.log
+}
+
 start_bots
 start_dashboard
+start_guard
 
 while true; do
   start_bots
   start_dashboard
+  start_guard
   sleep 60
 done

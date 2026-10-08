@@ -67,12 +67,23 @@ class Executor:
         )
         self.decisions_path = bots_dir() / "decisions.jsonl"
 
-    def _held_quantity(self) -> dict[str, float]:
-        out: dict[str, float] = {}
+    def _held_quantity(self) -> dict[tuple[str, str], float]:
+        """
+        Shares held, keyed by (exchange, side) — a YES lot can't cover a NO sell.
+
+        The API reports every position with option "YES"; the sign of quantity is
+        what says which side we're on, matching how risk.py reads positions.
+        """
+        out: dict[tuple[str, str], float] = {}
         for pos in self.positions_payload.get("positions") or []:
             if pos.get("settled"):
                 continue
-            out[str(pos.get("exchangeId"))] = abs(float(pos.get("quantity") or 0))
+            qty = float(pos.get("quantity") or 0)
+            if qty == 0:
+                continue
+            side = "yes" if qty > 0 else "no"
+            key = (str(pos.get("exchangeId")), side)
+            out[key] = out.get(key, 0.0) + abs(qty)
         return out
 
     def _cancel_stale_orders(self, orders: list[dict[str, Any]]) -> set[Any]:
@@ -107,29 +118,56 @@ class Executor:
         """
         Price that should actually trade, taken from the live book.
 
-        The book is quoted in YES terms, so NO orders need the complement.
+        The book is quoted in YES terms, so a NO order is the complement: the NO
+        bid is (1 - YES ask) and the NO ask is (1 - YES bid). A sell must hit its
+        own side's bid, so if that quote is missing there is no marketable price.
         """
         try:
             book = self.client.orderbook(exchange_id, depth=1)
         except Exception:  # noqa: BLE001
             return None
-        bid = book.get("bestBid")
-        ask = book.get("bestAsk")
         try:
-            bid = float(bid) if bid is not None else None
-            ask = float(ask) if ask is not None else None
+            raw_bid = book.get("bestBid")
+            raw_ask = book.get("bestAsk")
+            bid = float(raw_bid) if raw_bid is not None else None
+            ask = float(raw_ask) if raw_ask is not None else None
         except (TypeError, ValueError):
             return None
+
         if side == "yes":
             px = bid if action == "sell" else ask
+        elif action == "sell":
+            px = (1.0 - ask) if ask is not None else None
         else:
-            # NO sells hit the NO bid (1 - YES ask); NO buys lift the NO ask.
-            px = (1.0 - ask) if (action == "sell" and ask is not None) else (
-                (1.0 - bid) if bid is not None else None
-            )
+            px = (1.0 - bid) if bid is not None else None
         if px is None or px <= 0:
             return None
         return round_tick(px)
+
+    def _order_price(self, p: OrderProposal) -> tuple[float | None, str | None]:
+        """
+        Final limit price, plus a reason string when the order should be skipped.
+
+        Buys never pay above the proposal's limit — that limit is what the edge
+        was sized against. Sells cross to the bid so they actually fill, but not
+        into a hole far below the mark.
+        """
+        book_px = self._marketable_price(p.exchange_id, p.side, p.action)
+        own_px = float(p.price) if p.price is not None and p.price > 0 else None
+
+        if p.action == "buy":
+            if own_px is None:
+                return (book_px, None)
+            if book_px is not None:
+                return (round_tick(min(own_px, book_px)), None)
+            return (round_tick(own_px), None)
+
+        if book_px is None:
+            return (None if own_px is None else round_tick(own_px), None)
+        slip = float(self.cfg.order_max_sell_slippage)
+        if own_px is not None and slip > 0 and book_px < own_px * (1.0 - slip):
+            return (None, f"bid {book_px:.3f} is {slip:.0%}+ below target {own_px:.3f}")
+        return (book_px, None)
 
     def execute(self, proposals: list[OrderProposal]) -> list[dict[str, Any]]:
         exposure = exposure_by_race(self.positions_payload)
@@ -144,8 +182,9 @@ class Executor:
             try:
                 open_orders = self.client.open_orders(tournament_id=self.tournament_id)
             except Exception:  # noqa: BLE001
-                log.exception("Could not load open orders")
-                open_orders = []
+                # Placing blind is how the duplicate-order pile-up happened.
+                log.exception("Could not load open orders — skipping this cycle")
+                return []
             canceled = self._cancel_stale_orders(open_orders)
             for order in open_orders:
                 if order.get("id") in canceled:
@@ -188,8 +227,8 @@ class Executor:
                 )
                 continue
             if p.action == "sell":
-                # Never offer more than we actually hold
-                held_qty = int(held.get(str(p.exchange_id), 0))
+                # Never offer more than we actually hold on that side
+                held_qty = int(held.get((str(p.exchange_id), str(p.side)), 0))
                 if held_qty <= 0:
                     log.info("Skip sell — no position: %s", p.market_title[:50])
                     continue
@@ -223,9 +262,10 @@ class Executor:
                         working_cash,
                     )
                     qty = cash_qty
-                if qty <= 0:
+                if qty < max(1, int(self.cfg.bot_min_order_qty)):
                     log.info(
-                        "Skip buy (exposure/basket/circuit/cash cap): %s race=%s basket=%s",
+                        "Skip buy (cap leaves only %s shares): %s race=%s basket=%s",
+                        qty,
                         p.market_title[:50],
                         p.race_key,
                         basket,
@@ -254,9 +294,10 @@ class Executor:
         failures: list[str] = []
         for p in chosen:
             # Price off the live book so limits actually trade instead of resting
-            price = self._marketable_price(p.exchange_id, p.side, p.action)
-            if price is None:
-                price = None if p.price is None else round_tick(float(p.price))
+            price, skip_reason = self._order_price(p)
+            if skip_reason:
+                log.info("Skip %s — %s: %s", p.action, skip_reason, p.market_title[:50])
+                continue
             if p.action == "buy":
                 # Never trust optimistic sell proceeds — refresh live cash
                 if live:
@@ -295,6 +336,7 @@ class Executor:
                     "ts": datetime.now(timezone.utc).isoformat(),
                     "live": live,
                     "bot": p.bot,
+                    "exchange_id": p.exchange_id,
                     "title": p.market_title,
                     "side": p.side,
                     "action": p.action,
@@ -316,6 +358,7 @@ class Executor:
                     "ts": datetime.now(timezone.utc).isoformat(),
                     "live": live,
                     "bot": p.bot,
+                    "exchange_id": p.exchange_id,
                     "title": p.market_title,
                     "side": p.side,
                     "action": p.action,

@@ -12,6 +12,7 @@ from .circuit_breaker import circuit_status
 from .client import SuperMarketClient
 from .config import settings
 from .equity import equity_series, load_equity_points, record_equity_point, render_equity_svg
+from .trading_window import LIVE_OPEN
 from .paper_scoreboard import summarize_paper
 from .trading_window import window_status
 
@@ -132,7 +133,10 @@ def collect_snapshot() -> dict[str, Any]:
     except Exception:  # noqa: BLE001
         pass
 
-    series = equity_series(load_equity_points())
+    # Start the curve at the tournament open — the pre-open paper era is noise
+    series = equity_series(load_equity_points(since=LIVE_OPEN))
+    if (series.get("count") or 0) < 2:
+        series = equity_series(load_equity_points())
     snap["equity"] = {
         "first": series.get("first"),
         "last": series.get("last"),
