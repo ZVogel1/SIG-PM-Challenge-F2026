@@ -311,6 +311,7 @@ def rollback_failed_rotations(
     *,
     proposed_sell_ids: set[str],
     executed: list[dict[str, Any]],
+    resting_sell_ids: set[str] | None = None,
 ) -> dict[str, Any]:
     """
     Clear a pending rotation when its sell never filled.
@@ -318,6 +319,9 @@ def rollback_failed_rotations(
     The proposal path only soft-reserves via `pending`. Daily count and the
     cash earmark commit on a successful sell; a skip/reject must drop pending
     so the next cycle can try again instead of stalling for 20 minutes.
+
+    A sell that is already resting on the book is still in flight — do not
+    clear pending in that case or we thrash every cycle.
     """
     state = prune(state)
     pending = state.get("pending") or {}
@@ -331,7 +335,7 @@ def rollback_failed_rotations(
         for row in executed
         if row.get("ok") and row.get("action") == "sell"
     }
-    if funded in filled_sells:
+    if funded in filled_sells or funded in (resting_sell_ids or ()):
         return state
     log.warning("Rotation sell did not fill — clearing pending for %s", funded)
     state.pop("pending", None)

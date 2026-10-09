@@ -173,6 +173,7 @@ class Executor:
         exposure = exposure_by_race(self.positions_payload)
         basket_exp = exposure_by_basket(self.positions_payload)
         size_mult = self.size_mult
+        self.resting_sell_ids: set[str] = set()
         if size_mult < 1.0:
             log.warning("Circuit breaker active — buy size mult=%.2f", size_mult)
 
@@ -195,6 +196,8 @@ class Executor:
                     str(order.get("action")),
                 )
                 resting[key] = resting.get(key, 0) + int(order.get("quantity") or 0)
+                if str(order.get("action")).lower() == "sell":
+                    self.resting_sell_ids.add(str(order.get("exchangeId")))
             if resting:
                 log.info("Resting orders after cleanup: %s", len(resting))
         held = self._held_quantity()

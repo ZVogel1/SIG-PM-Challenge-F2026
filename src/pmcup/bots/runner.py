@@ -164,6 +164,8 @@ def run_cycle(cfg: Settings, *, cycle: int = 0) -> dict[str, Any]:
                 best_buy[key] = p
         # Tiny leftover trims shouldn't eat the order budget
         meaningful_sells = [p for p in sells if p.quantity >= 25]
+        rotation_sells = [p for p in meaningful_sells if "rotation" in (p.tags or [])]
+        other_sells = [p for p in meaningful_sells if "rotation" not in (p.tags or [])]
         # When cash is below target, sell first so same-cycle buys can reuse cash
         target_frac = float(getattr(cfg, "target_cash_frac", 0.0) or 0.0)
         cash_short = (
@@ -171,10 +173,12 @@ def run_cycle(cfg: Settings, *, cycle: int = 0) -> dict[str, Any]:
             and float(equity_now or 0) > 0
             and cash_f < float(equity_now or 0) * target_frac
         )
-        if cash_short:
-            merged = meaningful_sells + list(best_buy.values())
+        # Rotation sells always go first: the funding buy is useless until cash
+        # exists, and a resting prior sell must be resolved before we spam buys.
+        if cash_short or rotation_sells:
+            merged = rotation_sells + other_sells + list(best_buy.values())
         else:
-            merged = list(best_buy.values()) + meaningful_sells
+            merged = list(best_buy.values()) + other_sells
 
         sizing_bankroll = max(
             float(result.get("bankroll") or 0),
@@ -204,7 +208,7 @@ def run_cycle(cfg: Settings, *, cycle: int = 0) -> dict[str, Any]:
         executed = executor.execute(merged)
 
         # Lock out re-entry on anything we just sold, and retire filled earmarks.
-        # Roll back earmark + daily count if a rotation sell never filled.
+        # Roll back pending if a rotation sell never filled (unless it's resting).
         try:
             proposed_rot_sells = {
                 str(p.exchange_id) for p in rotations if p.action == "sell"
@@ -213,6 +217,7 @@ def run_cycle(cfg: Settings, *, cycle: int = 0) -> dict[str, Any]:
                 rotation_state,
                 proposed_sell_ids=proposed_rot_sells,
                 executed=executed,
+                resting_sell_ids=getattr(executor, "resting_sell_ids", set()),
             )
             rotation_state = record_rotation_fills(executed, cfg, state=rotation_state)
             save_rotation_state(rotation_state)

@@ -310,6 +310,19 @@ def test_failed_rotation_sell_clears_pending_without_burning_budget() -> None:
     assert state["earmarks"] == []
 
 
+def test_resting_rotation_sell_keeps_pending() -> None:
+    cfg = _cfg()
+    ideas = [_idea("100", 0.0), _idea("200", 0.40)]
+    props, state = rotation_proposals(_positions(), ideas, cfg, equity=100_000)
+    state = rollback_failed_rotations(
+        state,
+        proposed_sell_ids={props[0].exchange_id},
+        executed=[],
+        resting_sell_ids={"100"},
+    )
+    assert state.get("pending") is not None
+
+
 def test_budget_increments_only_after_rotation_sell_fills() -> None:
     cfg = _cfg()
     ideas = [_idea("100", 0.0), _idea("200", 0.40)]
