@@ -7,11 +7,13 @@ the spread every time. Rotation here is deliberately hard to trigger and, once
 triggered, is locked in one direction:
 
 * a market that was just sold cannot be bought back until its cooldown expires,
-* a market that was just bought cannot be sold until its cooldown expires,
 * cash freed by a rotation is earmarked, so only the intended target can spend it,
-* rotations are capped per day.
+* rotations are capped per day,
+* a failed rotation sell rolls back the earmark and the daily count so a reject
+  cannot stall the book or burn the budget.
 
-Those four rules make a sell/rebuy loop impossible rather than merely unlikely.
+Exits stay unrestricted: a loop needs sell -> buy -> sell, and blocking re-entry
+is enough. Trapping us in a dead thesis would be worse than a second sell.
 """
 
 from __future__ import annotations
@@ -155,21 +157,32 @@ def rotation_proposals(
 
     idea_by_ex: dict[str, TradeIdea] = {i.exchange_id: i for i in ideas}
     held: dict[str, dict[str, Any]] = {}
+    race_notional: dict[str, float] = {}
+    held_races: set[str] = set()
     for pos in positions_payload.get("positions") or []:
         if pos.get("settled"):
             continue
         qty = float(pos.get("quantity") or 0)
         if qty == 0:
             continue
-        held[str(pos.get("exchangeId"))] = pos
+        exchange_id = str(pos.get("exchangeId"))
+        held[exchange_id] = pos
+        title = str(pos.get("marketTitle") or exchange_id)
+        race = race_key_from_title(title)
+        held_races.add(race)
+        side = "yes" if qty > 0 else "no"
+        mark = float(pos.get("currentPrice") or 0)
+        own_mark = (1.0 - mark) if side == "no" else mark
+        race_notional[race] = race_notional.get(race, 0.0) + abs(qty) * max(own_mark, 0.0)
 
-    # Best idea in a market we don't already hold and may buy
+    # Best idea in a race we don't already hold (party mirrors count as one race)
     candidates = [
         i
         for i in ideas
         if i.action == "buy"
         and float(i.net_edge) >= float(cfg.min_edge)
         and str(i.exchange_id) not in held
+        and (i.race_key or race_key_from_title(i.market_title)) not in held_races
         and not locked(state, i.exchange_id, "buy")
     ]
     if not candidates:
@@ -177,11 +190,11 @@ def rotation_proposals(
     target = max(candidates, key=lambda i: float(i.net_edge))
 
     # Weakest position we're allowed to sell that's actually worth selling.
-    # Dust holdings have the weakest edge but free no cash, so rank by edge and
-    # break ties toward the larger position.
+    # Prefer races already over the exposure cap, then weakest edge, then size.
     min_qty = max(1, int(cfg.bot_min_order_qty))
     max_notional = float(equity) * float(cfg.rotation_max_frac_per_trade)
-    sellable: list[tuple[float, float, dict[str, Any], str, int]] = []
+    race_cap = float(cfg.max_race_exposure_frac) * float(equity)
+    sellable: list[tuple[float, float, float, dict[str, Any], str, int]] = []
     for exchange_id, pos in held.items():
         if locked(state, exchange_id, "sell"):
             continue
@@ -196,10 +209,15 @@ def rotation_proposals(
         if sell_qty < min_qty:
             continue
         edge = _held_edge(idea_by_ex.get(exchange_id), side)
-        sellable.append((edge, -(sell_qty * own_mark), pos, side, sell_qty))
+        race = race_key_from_title(str(pos.get("marketTitle") or exchange_id))
+        # Negative when over cap so min() picks overweight races first
+        over = min(0.0, race_cap - float(race_notional.get(race, 0.0)))
+        sellable.append((over, edge, -(sell_qty * own_mark), pos, side, sell_qty))
     if not sellable:
         return [], state
-    worst_edge, _, worst_pos, worst_side, sell_qty = min(sellable, key=lambda t: (t[0], t[1]))
+    _, worst_edge, _, worst_pos, worst_side, sell_qty = min(
+        sellable, key=lambda t: (t[0], t[1], t[2])
+    )
 
     gain = float(target.net_edge) - worst_edge
     if gain < float(cfg.rotation_min_edge_gain):
@@ -276,6 +294,47 @@ def filter_buys(
             continue
         out.append(p)
     return out
+
+
+def rollback_failed_rotations(
+    state: dict[str, Any],
+    *,
+    proposed_sell_ids: set[str],
+    executed: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """
+    Undo earmarks and daily budget when a rotation sell never filled.
+
+    The proposal path reserves the budget up front so only one rotation can be
+    in flight. If the exchange rejects the sell, that reservation would otherwise
+    stall buys for the earmark window and permanently burn a daily slot.
+    """
+    state = prune(state)
+    if not proposed_sell_ids:
+        return state
+    filled_sells = {
+        str(row.get("exchange_id") or "")
+        for row in executed
+        if row.get("ok") and row.get("action") == "sell"
+    }
+    failed = {ex for ex in proposed_sell_ids if ex and ex not in filled_sells}
+    if not failed:
+        return state
+    before = len(state.get("earmarks") or [])
+    state["earmarks"] = [
+        e for e in (state.get("earmarks") or []) if str(e.get("funded_by")) not in failed
+    ]
+    rolled = before - len(state["earmarks"])
+    if rolled > 0:
+        day = _now().date().isoformat()
+        used = int((state.get("rotations") or {}).get(day, 0))
+        state.setdefault("rotations", {})[day] = max(0, used - rolled)
+        log.warning(
+            "Rolled back %s failed rotation(s); daily count now %s",
+            rolled,
+            state["rotations"][day],
+        )
+    return state
 
 
 def record_fills(

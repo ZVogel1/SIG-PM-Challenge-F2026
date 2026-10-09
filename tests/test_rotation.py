@@ -8,6 +8,7 @@ from pmcup.bots.rotation import (
     filter_buys,
     locked,
     record_fills,
+    rollback_failed_rotations,
     rotation_proposals,
     rotations_today,
 )
@@ -277,3 +278,124 @@ def test_sell_size_capped_by_equity_fraction() -> None:
     # 1% of 100k = 1,000 notional at a 0.40 mark -> ~2,500 shares, never above
     assert 2_490 <= props[0].quantity <= 2_500
     assert props[0].quantity * 0.40 <= 1_000
+
+
+def test_failed_rotation_sell_rolls_back_budget_and_earmark() -> None:
+    cfg = _cfg()
+    ideas = [_idea("100", 0.0), _idea("200", 0.40)]
+    props, state = rotation_proposals(_positions(), ideas, cfg, equity=100_000)
+    assert rotations_today(state) == 1
+    assert state["earmarks"]
+    state = rollback_failed_rotations(
+        state,
+        proposed_sell_ids={props[0].exchange_id},
+        executed=[{"ok": False, "exchange_id": "100", "action": "sell"}],
+    )
+    assert rotations_today(state) == 0
+    assert state["earmarks"] == []
+
+
+def test_does_not_rotate_into_a_race_already_held() -> None:
+    """Selling Dem PA-08 to buy Rep PA-08 is the same race, not diversification."""
+    cfg = _cfg()
+    positions = {
+        "positions": [
+            {
+                "exchangeId": "dem",
+                "marketId": "m",
+                "marketTitle": "Will the Democratic Party win the PA-08 House race?",
+                "quantity": -10_000,
+                "currentPrice": 0.30,
+                "settled": False,
+            }
+        ]
+    }
+    ideas = [
+        TradeIdea(
+            market_id="rep",
+            market_title="Will the Republican Party win the PA-08 House race?",
+            exchange_id="rep",
+            side="yes",
+            action="buy",
+            market_price=0.3,
+            fair_prob=0.55,
+            edge=0.25,
+            size=100,
+            stake=30.0,
+            rationale="test",
+            source="fair_prob",
+            net_edge=0.25,
+            race_key="pa-08 house race",
+        ),
+        _idea("other", 0.20),
+    ]
+    # Only "other" is a new race; 0.20 vs held edge 0 is not enough gain (need 0.10
+    # against a zero-edge hold — wait, gain would be 0.20). Give held a strong edge
+    # via a same-side idea so we only care about candidate filtering.
+    ideas_hold = [
+        TradeIdea(
+            market_id="dem",
+            market_title="Will the Democratic Party win the PA-08 House race?",
+            exchange_id="dem",
+            side="no",
+            action="buy",
+            market_price=0.3,
+            fair_prob=0.55,
+            edge=0.05,
+            size=100,
+            stake=30.0,
+            rationale="test",
+            source="fair_prob",
+            net_edge=0.05,
+            race_key="pa-08 house race",
+        ),
+        ideas[0],
+        TradeIdea(
+            market_id="other",
+            market_title="Will the Republican Party win the CO-08 House race?",
+            exchange_id="other",
+            side="yes",
+            action="buy",
+            market_price=0.2,
+            fair_prob=0.45,
+            edge=0.25,
+            size=100,
+            stake=20.0,
+            rationale="test",
+            source="fair_prob",
+            net_edge=0.25,
+            race_key="co-08 house race",
+        ),
+    ]
+    props, state = rotation_proposals(positions, ideas_hold, cfg, equity=100_000)
+    assert len(props) == 1
+    # Earmark must fund the new race, not the PA-08 party mirror
+    assert [e["target"] for e in state["earmarks"]] == ["other"]
+
+
+def test_prefers_selling_an_over_cap_race() -> None:
+    cfg = _cfg(max_race_exposure_frac=0.10, rotation_max_frac_per_trade=0.04)
+    positions = {
+        "positions": [
+            {
+                "exchangeId": "fat",
+                "marketId": "m1",
+                "marketTitle": "Will the Republican Party win the Alaska Senate?",
+                "quantity": 50_000,
+                "currentPrice": 0.40,
+                "settled": False,
+            },
+            {
+                "exchangeId": "thin",
+                "marketId": "m2",
+                "marketTitle": "Will the Republican Party win the Maine Senate?",
+                "quantity": 5_000,
+                "currentPrice": 0.40,
+                "settled": False,
+            },
+        ]
+    }
+    # Both holds have zero remaining edge; over-cap Alaska should be sold first
+    ideas = [_idea("fresh", 0.30)]
+    props, _ = rotation_proposals(positions, ideas, cfg, equity=100_000)
+    assert props[0].exchange_id == "fat"

@@ -26,6 +26,7 @@ from .rotation import (
     filter_buys as filter_rotation_buys,
     load_state as load_rotation_state,
     prune as prune_rotation,
+    rollback_failed_rotations,
     rotation_proposals,
     save_state as save_rotation_state,
 )
@@ -129,6 +130,7 @@ def run_cycle(cfg: Settings, *, cycle: int = 0) -> dict[str, Any]:
             equity_now = cash_f + float(paper_pre.get("total_pnl") or 0)
 
         rotation_state = prune_rotation(load_rotation_state())
+        rotations: list[OrderProposal] = []
         if cfg.bot_enable_risk:
             proposals.extend(risk_exit_proposals(positions, ideas, cfg))
             if float(getattr(cfg, "target_cash_frac", 0.0) or 0.0) > 0:
@@ -201,8 +203,17 @@ def run_cycle(cfg: Settings, *, cycle: int = 0) -> dict[str, Any]:
         )
         executed = executor.execute(merged)
 
-        # Lock out re-entry on anything we just sold, and retire filled earmarks
+        # Lock out re-entry on anything we just sold, and retire filled earmarks.
+        # Roll back earmark + daily count if a rotation sell never filled.
         try:
+            proposed_rot_sells = {
+                str(p.exchange_id) for p in rotations if p.action == "sell"
+            }
+            rotation_state = rollback_failed_rotations(
+                rotation_state,
+                proposed_sell_ids=proposed_rot_sells,
+                executed=executed,
+            )
             rotation_state = record_rotation_fills(executed, cfg, state=rotation_state)
             save_rotation_state(rotation_state)
         except Exception:  # noqa: BLE001
