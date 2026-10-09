@@ -88,6 +88,9 @@ def prune(state: dict[str, Any]) -> dict[str, Any]:
     state["earmarks"] = [
         e for e in (state.get("earmarks") or []) if (_parse(e.get("expires")) or now) > now
     ]
+    pending = state.get("pending")
+    if pending and (_parse(pending.get("expires")) or now) <= now:
+        state.pop("pending", None)
     cutoff = (now - timedelta(days=7)).date().isoformat()
     state["rotations"] = {
         day: n for day, n in (state.get("rotations") or {}).items() if day >= cutoff
@@ -151,8 +154,9 @@ def rotation_proposals(
     if rotations_today(state) >= int(cfg.rotation_max_per_day):
         log.info("Rotation budget for today is used up")
         return [], state
-    if state.get("earmarks"):
-        # One rotation in flight at a time: wait for the earmarked buy to land
+    if state.get("earmarks") or state.get("pending"):
+        # One rotation in flight at a time: wait for the sell (pending) or
+        # the earmarked buy to land before starting another.
         return [], state
 
     idea_by_ex: dict[str, TradeIdea] = {i.exchange_id: i for i in ideas}
@@ -225,6 +229,8 @@ def rotation_proposals(
 
     title = str(worst_pos.get("marketTitle") or worst_pos.get("exchangeId"))
     exchange_id = str(worst_pos.get("exchangeId"))
+    # Earmark + daily count commit only after this sell fills (see record_fills).
+    # Reserving them here burned budget when the executor skipped the sell.
     proposal = OrderProposal(
         bot="risk_manager",
         exchange_id=exchange_id,
@@ -240,20 +246,21 @@ def rotation_proposals(
         ),
         priority=750,
         race_key=race_key_from_title(title),
-        tags=["risk", "rotation"],
+        tags=[
+            "risk",
+            "rotation",
+            f"earmark:{target.exchange_id}",
+            f"earmark_side:{target.side}",
+        ],
     )
-
-    state.setdefault("earmarks", []).append(
-        {
-            "target": str(target.exchange_id),
-            "side": target.side,
-            "funded_by": exchange_id,
-            "created": _now().isoformat(),
-            "expires": (_now() + timedelta(minutes=float(cfg.rotation_earmark_minutes))).isoformat(),
-        }
-    )
-    day = _now().date().isoformat()
-    state["rotations"][day] = rotations_today(state) + 1
+    # Soft reservation so the next cycle does not stack another sell before
+    # this one fills. Count + real earmark commit only in record_fills.
+    state["pending"] = {
+        "funded_by": exchange_id,
+        "target": str(target.exchange_id),
+        "side": target.side,
+        "expires": (_now() + timedelta(minutes=float(cfg.rotation_earmark_minutes))).isoformat(),
+    }
     log.info(
         "Rotation: sell %s x%s to fund %s (edge %.1f%% vs %.1f%%)",
         title[:40],
@@ -281,6 +288,9 @@ def filter_buys(
         return proposals
     state = prune(state if state is not None else load_state())
     targets = earmarked_targets(state)
+    pending = state.get("pending") or {}
+    if pending.get("target"):
+        targets = targets | {str(pending["target"])}
     out: list[OrderProposal] = []
     for p in proposals:
         if p.action != "buy":
@@ -303,37 +313,32 @@ def rollback_failed_rotations(
     executed: list[dict[str, Any]],
 ) -> dict[str, Any]:
     """
-    Undo earmarks and daily budget when a rotation sell never filled.
+    Clear a pending rotation when its sell never filled.
 
-    The proposal path reserves the budget up front so only one rotation can be
-    in flight. If the exchange rejects the sell, that reservation would otherwise
-    stall buys for the earmark window and permanently burn a daily slot.
+    The proposal path only soft-reserves via `pending`. Daily count and the
+    cash earmark commit on a successful sell; a skip/reject must drop pending
+    so the next cycle can try again instead of stalling for 20 minutes.
     """
     state = prune(state)
-    if not proposed_sell_ids:
+    pending = state.get("pending") or {}
+    funded = str(pending.get("funded_by") or "")
+    if not funded:
+        return state
+    if proposed_sell_ids and funded not in proposed_sell_ids:
         return state
     filled_sells = {
         str(row.get("exchange_id") or "")
         for row in executed
         if row.get("ok") and row.get("action") == "sell"
     }
-    failed = {ex for ex in proposed_sell_ids if ex and ex not in filled_sells}
-    if not failed:
+    if funded in filled_sells:
         return state
-    before = len(state.get("earmarks") or [])
+    log.warning("Rotation sell did not fill — clearing pending for %s", funded)
+    state.pop("pending", None)
+    # Drop any orphan earmark left by older builds that reserved before fill
     state["earmarks"] = [
-        e for e in (state.get("earmarks") or []) if str(e.get("funded_by")) not in failed
+        e for e in (state.get("earmarks") or []) if str(e.get("funded_by")) != funded
     ]
-    rolled = before - len(state["earmarks"])
-    if rolled > 0:
-        day = _now().date().isoformat()
-        used = int((state.get("rotations") or {}).get(day, 0))
-        state.setdefault("rotations", {})[day] = max(0, used - rolled)
-        log.warning(
-            "Rolled back %s failed rotation(s); daily count now %s",
-            rolled,
-            state["rotations"][day],
-        )
     return state
 
 
@@ -350,6 +355,9 @@ def record_fills(
     A loop needs sell -> buy -> sell. Blocking the re-entry breaks the cycle at
     its first step, while leaving exits unrestricted so risk management still
     works whenever a thesis really does break.
+
+    Rotation earmarks and the daily count also land here — only on a successful
+    sell — so a skipped/rejected sell cannot reserve cash or burn the budget.
     """
     state = prune(state if state is not None else load_state())
     hours = float(cfg.rotation_cooldown_hours)
@@ -362,6 +370,42 @@ def record_fills(
             continue
         if row.get("action") == "sell":
             _lock(state, exchange_id, "buy", hours)
+            tags = [str(t) for t in (row.get("tags") or [])]
+            if "rotation" in tags:
+                target = next(
+                    (
+                        t.split(":", 1)[1]
+                        for t in tags
+                        if t.startswith("earmark:") and not t.startswith("earmark_side:")
+                    ),
+                    "",
+                )
+                side = next(
+                    (t.split(":", 1)[1] for t in tags if t.startswith("earmark_side:")),
+                    "yes",
+                )
+                if not target:
+                    pending = state.get("pending") or {}
+                    if str(pending.get("funded_by")) == exchange_id:
+                        target = str(pending.get("target") or "")
+                        side = str(pending.get("side") or side)
+                if target:
+                    state.setdefault("earmarks", []).append(
+                        {
+                            "target": target,
+                            "side": side,
+                            "funded_by": exchange_id,
+                            "created": _now().isoformat(),
+                            "expires": (
+                                _now()
+                                + timedelta(minutes=float(cfg.rotation_earmark_minutes))
+                            ).isoformat(),
+                        }
+                    )
+                    day = _now().date().isoformat()
+                    state.setdefault("rotations", {})[day] = rotations_today(state) + 1
+                if str((state.get("pending") or {}).get("funded_by")) == exchange_id:
+                    state.pop("pending", None)
         else:
             bought.add(exchange_id)
 

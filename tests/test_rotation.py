@@ -105,7 +105,8 @@ def test_sold_market_cannot_be_bought_back() -> None:
 def test_freed_cash_is_earmarked_for_the_target_only() -> None:
     cfg = _cfg()
     ideas = [_idea("100", 0.20), _idea("200", 0.35)]
-    _, state = rotation_proposals(_positions(), ideas, cfg, equity=100_000)
+    props, state = rotation_proposals(_positions(), ideas, cfg, equity=100_000)
+    state = record_fills([_fill(props[0])], cfg, state=state)
 
     def buy(ex: str) -> OrderProposal:
         return OrderProposal(
@@ -135,7 +136,7 @@ def test_one_rotation_in_flight_at_a_time() -> None:
     cfg = _cfg()
     ideas = [_idea("100", 0.20), _idea("200", 0.35)]
     _, state = rotation_proposals(_positions(), ideas, cfg, equity=100_000)
-    # Earmark still open -> no second rotation
+    # Pending sell still open -> no second rotation
     again, state = rotation_proposals(_positions(), ideas, cfg, equity=100_000, state=state)
     assert again == []
 
@@ -161,8 +162,12 @@ def test_daily_rotation_budget_is_enforced() -> None:
         props, state = rotation_proposals(positions, ideas, cfg, equity=100_000, state=state)
         if props:
             fired += 1
-            # simulate the buy landing so the earmark clears
-            state = record_fills([_fill(_buy(f"{900 + round_}"))], cfg, state=state)
+            # sell fills (counts against budget) then buy clears the earmark
+            state = record_fills(
+                [_fill(props[0]), _fill(_buy(f"{900 + round_}"))],
+                cfg,
+                state=state,
+            )
     assert fired == 2
     assert rotations_today(state) == 2
 
@@ -176,7 +181,13 @@ def _buy(ex: str, qty: int = 1_000, price: float = 0.3) -> OrderProposal:
 
 
 def _fill(p: OrderProposal) -> dict[str, Any]:
-    return {"ok": True, "exchange_id": p.exchange_id, "action": p.action, "qty": p.quantity}
+    return {
+        "ok": True,
+        "exchange_id": p.exchange_id,
+        "action": p.action,
+        "qty": p.quantity,
+        "tags": list(p.tags or []),
+    }
 
 
 def test_sold_market_is_locked_out_after_any_sell() -> None:
@@ -214,6 +225,9 @@ def test_many_cycles_cannot_churn() -> None:
             orders += 1
             sold.add(sell.exchange_id)
             fills.append(_fill(sell))
+        # Commit locks/earmarks from sells before the buyer acts
+        state = record_fills(fills, cfg, state=state)
+        fills = []
 
         # The buyer always wants both markets; only cash and the filters stop it
         for want in filter_buys([_buy("100"), _buy("200")], cfg, state=state):
@@ -280,19 +294,31 @@ def test_sell_size_capped_by_equity_fraction() -> None:
     assert props[0].quantity * 0.40 <= 1_000
 
 
-def test_failed_rotation_sell_rolls_back_budget_and_earmark() -> None:
+def test_failed_rotation_sell_clears_pending_without_burning_budget() -> None:
     cfg = _cfg()
     ideas = [_idea("100", 0.0), _idea("200", 0.40)]
     props, state = rotation_proposals(_positions(), ideas, cfg, equity=100_000)
-    assert rotations_today(state) == 1
-    assert state["earmarks"]
+    assert state.get("pending")
+    assert rotations_today(state) == 0
     state = rollback_failed_rotations(
         state,
         proposed_sell_ids={props[0].exchange_id},
-        executed=[{"ok": False, "exchange_id": "100", "action": "sell"}],
+        executed=[],  # executor skipped the sell entirely
     )
+    assert state.get("pending") is None
     assert rotations_today(state) == 0
     assert state["earmarks"] == []
+
+
+def test_budget_increments_only_after_rotation_sell_fills() -> None:
+    cfg = _cfg()
+    ideas = [_idea("100", 0.0), _idea("200", 0.40)]
+    props, state = rotation_proposals(_positions(), ideas, cfg, equity=100_000)
+    assert rotations_today(state) == 0
+    state = record_fills([_fill(props[0])], cfg, state=state)
+    assert rotations_today(state) == 1
+    assert state["earmarks"][0]["target"] == "200"
+    assert state.get("pending") is None
 
 
 def test_does_not_rotate_into_a_race_already_held() -> None:
@@ -369,6 +395,7 @@ def test_does_not_rotate_into_a_race_already_held() -> None:
     ]
     props, state = rotation_proposals(positions, ideas_hold, cfg, equity=100_000)
     assert len(props) == 1
+    state = record_fills([_fill(props[0])], cfg, state=state)
     # Earmark must fund the new race, not the PA-08 party mirror
     assert [e["target"] for e in state["earmarks"]] == ["other"]
 

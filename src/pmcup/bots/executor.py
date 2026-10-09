@@ -344,6 +344,7 @@ class Executor:
                     "price": price,
                     "reason": p.reason,
                     "priority": p.priority,
+                    "tags": list(p.tags or []),
                     "response": resp,
                     "ok": True,
                 }
@@ -365,6 +366,7 @@ class Executor:
                     "qty": p.quantity,
                     "price": price,
                     "reason": p.reason,
+                    "tags": list(p.tags or []),
                     "ok": False,
                     "error": str(exc),
                 }
