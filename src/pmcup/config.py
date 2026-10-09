@@ -58,7 +58,8 @@ class Settings(BaseSettings):
     rotation_cooldown_hours: float = 12.0  # no re-trading a rotated market
     # Worst-case daily turnover is max_per_day * max_frac * 2 (a sell and a buy),
     # so these two numbers are the hard ceiling on what churn can ever cost.
-    rotation_max_per_day: int = 3
+    # 8 * 0.04 * 2 = 64% of equity/day at the absolute worst.
+    rotation_max_per_day: int = 8
     rotation_max_frac_per_trade: float = 0.04
     rotation_earmark_minutes: float = 20.0  # freed cash reserved for the target
     # Keep running after failures (systemd/watchdog restart). Notify after N fails.
