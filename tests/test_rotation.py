@@ -439,3 +439,72 @@ def test_prefers_selling_an_over_cap_race() -> None:
     ideas = [_idea("fresh", 0.30)]
     props, _ = rotation_proposals(positions, ideas, cfg, equity=100_000)
     assert props[0].exchange_id == "fat"
+
+
+def test_over_cap_strong_thesis_does_not_block_rotation() -> None:
+    """
+    Regression: ranking by over-cap *before* the gain filter made us try to sell
+    TX-23 (still +22% edge) every cycle, fail the gain check, and never rotate
+    into FL-09 — freezing the book for ~43 hours.
+    """
+    cfg = _cfg(max_race_exposure_frac=0.10, rotation_max_frac_per_trade=0.04)
+    positions = {
+        "positions": [
+            {
+                "exchangeId": "fat_strong",
+                "marketId": "m1",
+                "marketTitle": "Will the Democratic Party win the TX-23 House race?",
+                "quantity": -50_000,  # NO, large
+                "currentPrice": 0.40,
+                "settled": False,
+            },
+            {
+                "exchangeId": "tired",
+                "marketId": "m2",
+                "marketTitle": "Will the Republican Party win the Maine Senate?",
+                "quantity": 10_000,
+                "currentPrice": 0.40,
+                "settled": False,
+            },
+        ]
+    }
+    ideas = [
+        # Still love the overweight TX-23
+        TradeIdea(
+            market_id="fat_strong",
+            market_title="Will the Democratic Party win the TX-23 House race?",
+            exchange_id="fat_strong",
+            side="no",
+            action="buy",
+            market_price=0.4,
+            fair_prob=0.65,
+            edge=0.22,
+            size=100,
+            stake=40.0,
+            rationale="test",
+            source="fair_prob",
+            net_edge=0.22,
+            race_key="tx-23 house race",
+        ),
+        # Tired Maine has no edge left
+        TradeIdea(
+            market_id="tired",
+            market_title="Will the Republican Party win the Maine Senate?",
+            exchange_id="tired",
+            side="yes",
+            action="buy",
+            market_price=0.4,
+            fair_prob=0.40,
+            edge=0.0,
+            size=100,
+            stake=40.0,
+            rationale="test",
+            source="fair_prob",
+            net_edge=0.0,
+            race_key="maine senate",
+        ),
+        _idea("fresh", 0.20),
+    ]
+    props, _ = rotation_proposals(positions, ideas, cfg, equity=100_000)
+    assert len(props) == 1
+    assert props[0].exchange_id == "tired"

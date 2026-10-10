@@ -193,12 +193,15 @@ def rotation_proposals(
         return [], state
     target = max(candidates, key=lambda i: float(i.net_edge))
 
-    # Weakest position we're allowed to sell that's actually worth selling.
-    # Prefer races already over the exposure cap, then weakest edge, then size.
+    # Sellable positions that can actually fund a trade. Prefer overweight
+    # races among those that clear the edge-gain bar — never let an overweight
+    # *strong* thesis block rotation forever (that froze the book for ~2 days).
     min_qty = max(1, int(cfg.bot_min_order_qty))
     max_notional = float(equity) * float(cfg.rotation_max_frac_per_trade)
     race_cap = float(cfg.max_race_exposure_frac) * float(equity)
-    sellable: list[tuple[float, float, float, dict[str, Any], str, int]] = []
+    min_gain = float(cfg.rotation_min_edge_gain)
+    target_edge = float(target.net_edge)
+    sellable: list[tuple[int, float, float, dict[str, Any], str, int]] = []
     for exchange_id, pos in held.items():
         if locked(state, exchange_id, "sell"):
             continue
@@ -213,19 +216,17 @@ def rotation_proposals(
         if sell_qty < min_qty:
             continue
         edge = _held_edge(idea_by_ex.get(exchange_id), side)
+        if target_edge - edge < min_gain:
+            continue
         race = race_key_from_title(str(pos.get("marketTitle") or exchange_id))
-        # Negative when over cap so min() picks overweight races first
-        over = min(0.0, race_cap - float(race_notional.get(race, 0.0)))
-        sellable.append((over, edge, -(sell_qty * own_mark), pos, side, sell_qty))
+        over_cap = 0 if float(race_notional.get(race, 0.0)) > race_cap else 1
+        sellable.append((over_cap, edge, -(sell_qty * own_mark), pos, side, sell_qty))
     if not sellable:
         return [], state
-    _, worst_edge, _, worst_pos, worst_side, sell_qty = min(
+    over_cap, worst_edge, _, worst_pos, worst_side, sell_qty = min(
         sellable, key=lambda t: (t[0], t[1], t[2])
     )
-
-    gain = float(target.net_edge) - worst_edge
-    if gain < float(cfg.rotation_min_edge_gain):
-        return [], state
+    gain = target_edge - worst_edge
 
     title = str(worst_pos.get("marketTitle") or worst_pos.get("exchangeId"))
     exchange_id = str(worst_pos.get("exchangeId"))
