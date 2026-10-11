@@ -13,7 +13,7 @@ class _BoomClient:
         self._tournament = tournament
         self._tournaments = tournaments
 
-    def tournament(self, slug: str):
+    def tournament(self, slug: str, *, max_retries: int | None = None):
         if self._tournament is None:
             raise RuntimeError("503")
         return self._tournament
