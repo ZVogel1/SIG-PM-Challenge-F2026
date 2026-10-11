@@ -64,14 +64,19 @@ def _resolve_tournament(client: SuperMarketClient, cfg: Settings) -> tuple[str, 
     match: dict[str, Any] | None = None
 
     # Prefer direct slug lookup — the list endpoint 503s more often.
+    # When a cache exists, keep retries short so a 503 doesn't eat the cycle.
     if slug:
+        cached_first = _load_tournament_cache(slug)
         try:
-            raw = client.tournament(slug)
+            raw = client.tournament(slug, max_retries=2 if cached_first else None)
             match = raw.get("data") if isinstance(raw, dict) and "data" in raw and "id" not in raw else raw
             if not isinstance(match, dict) or match.get("id") is None:
                 match = None
         except Exception as exc:  # noqa: BLE001
             log.warning("tournament(%s) failed: %s", slug, exc)
+            if cached_first:
+                log.warning("using cached tournament %s id=%s", cached_first[0], cached_first[1])
+                return cached_first
 
     if match is None:
         try:

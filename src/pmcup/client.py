@@ -45,8 +45,8 @@ class SuperMarketClient:
             return True
         return False
 
-    def _request(self, method: str, path: str, **kwargs: Any) -> Any:
-        retries = max(1, int(self.cfg.http_max_retries))
+    def _request(self, method: str, path: str, *, max_retries: int | None = None, **kwargs: Any) -> Any:
+        retries = max(1, int(self.cfg.http_max_retries if max_retries is None else max_retries))
         backoff = float(self.cfg.http_retry_backoff_s)
         last_exc: BaseException | None = None
         for attempt in range(retries):
@@ -106,9 +106,9 @@ class SuperMarketClient:
             raise last_exc
         raise RuntimeError(f"Request failed: {method} {path}")
 
-    def _get(self, path: str, **params: Any) -> Any:
+    def _get(self, path: str, *, max_retries: int | None = None, **params: Any) -> Any:
         clean = {k: v for k, v in params.items() if v is not None}
-        return self._request("GET", path, params=clean)
+        return self._request("GET", path, params=clean, max_retries=max_retries)
 
     def _post(self, path: str, body: dict[str, Any]) -> Any:
         return self._request("POST", path, json=body)
@@ -120,8 +120,8 @@ class SuperMarketClient:
         data = self._get("/tournaments", status=status, limit=100)
         return data.get("data", [])
 
-    def tournament(self, slug: str) -> dict[str, Any]:
-        return self._get(f"/tournaments/{slug}")
+    def tournament(self, slug: str, *, max_retries: int | None = None) -> dict[str, Any]:
+        return self._get(f"/tournaments/{slug}", max_retries=max_retries)
 
     def list_tournament_markets(
         self,
@@ -182,17 +182,39 @@ class SuperMarketClient:
         *,
         tournament_id: str | None = None,
     ) -> list[dict[str, Any]]:
-        # Smaller chunks: 100-id URLs were 503'ing and killing whole scan cycles.
+        # Smaller chunks + per-chunk soft-fail: one 503 must not kill the cycle.
+        # Risk exits (take-profit) use position marks; quotes fall back to
+        # market.latestPrice when a chunk is missing.
         results: list[dict[str, Any]] = []
         chunk_size = 40
+        failed_chunks = 0
         for i in range(0, len(exchange_ids), chunk_size):
             chunk = exchange_ids[i : i + chunk_size]
-            payload = self._get(
-                "/exchanges/prices",
-                ids=",".join(chunk),
-                tournamentId=tournament_id,
+            try:
+                # Short retries: soft-fail the chunk instead of burning ~22s each.
+                payload = self._get(
+                    "/exchanges/prices",
+                    ids=",".join(chunk),
+                    tournamentId=tournament_id,
+                    max_retries=2,
+                )
+                results.extend(payload.get("data", []))
+            except Exception as exc:  # noqa: BLE001
+                failed_chunks += 1
+                log.warning(
+                    "bulk_prices chunk %s-%s failed (%s); continuing with partial prices",
+                    i,
+                    i + len(chunk),
+                    exc,
+                )
+        if failed_chunks:
+            log.warning(
+                "bulk_prices: %s/%s chunks failed; got %s/%s prices",
+                failed_chunks,
+                (len(exchange_ids) + chunk_size - 1) // chunk_size,
+                len(results),
+                len(exchange_ids),
             )
-            results.extend(payload.get("data", []))
         return results
 
     def orderbook(
