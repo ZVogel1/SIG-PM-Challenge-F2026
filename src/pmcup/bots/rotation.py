@@ -297,6 +297,12 @@ def filter_buys(
         targets = targets | {str(pending["target"])}
     out: list[OrderProposal] = []
     for p in proposals:
+        if p.action == "sell":
+            if locked(state, p.exchange_id, "sell"):
+                log.info("Skip sell — cooling down after a full fill: %s", p.market_title[:50])
+                continue
+            out.append(p)
+            continue
         if p.action != "buy":
             out.append(p)
             continue
@@ -378,6 +384,12 @@ def record_fills(
             continue
         if row.get("action") == "sell":
             _lock(state, exchange_id, "buy", hours)
+            # Some lots still show in /positions after a full fill; without a
+            # sell lock we'd re-hit take-profit on the ghost qty every cycle.
+            resp = row.get("response") or {}
+            traded = float(resp.get("quantityTraded") or 0)
+            if traded > 0 and not resp.get("open"):
+                _lock(state, exchange_id, "sell", hours)
             tags = [str(t) for t in (row.get("tags") or [])]
             if "rotation" in tags:
                 target = next(

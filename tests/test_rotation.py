@@ -200,6 +200,42 @@ def test_sold_market_is_locked_out_after_any_sell() -> None:
     assert filter_buys([_buy("777")], cfg, state=state) == []
 
 
+def test_full_fill_sell_locks_resell_on_ghost_position() -> None:
+    cfg = _cfg()
+    state = record_fills(
+        [
+            {
+                "ok": True,
+                "exchange_id": "982",
+                "action": "sell",
+                "qty": 38,
+                "response": {
+                    "open": False,
+                    "quantityTraded": 38,
+                    "remainingQuantity": 0,
+                },
+            }
+        ],
+        cfg,
+    )
+    assert locked(state, "982", "sell")
+    assert locked(state, "982", "buy")
+    resell = OrderProposal(
+        bot="risk_manager",
+        exchange_id="982",
+        market_id="m",
+        market_title="Texas Senate",
+        side="no",
+        action="sell",
+        quantity=38,
+        price=0.4,
+        reason="Take profit",
+        priority=900,
+        tags=["risk", "exit"],
+    )
+    assert filter_buys([resell], cfg, state=state) == []
+
+
 def test_many_cycles_cannot_churn() -> None:
     """
     The failure this module exists to prevent: a static view of the world the
