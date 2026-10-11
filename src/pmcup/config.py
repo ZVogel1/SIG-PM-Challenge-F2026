@@ -93,7 +93,8 @@ class Settings(BaseSettings):
     # A buy this small is noise once a cap is nearly full — skip it instead
     bot_min_order_qty: int = 25
 
-    order_stale_seconds: int = 600
+    # Take-profit / rotation sells must reprice quickly; 10m left orphans resting.
+    order_stale_seconds: int = 180
     max_cancels_per_cycle: int = 40
     # Don't dump an exit into a hole: skip if the bid is this far below target
     order_max_sell_slippage: float = 0.15

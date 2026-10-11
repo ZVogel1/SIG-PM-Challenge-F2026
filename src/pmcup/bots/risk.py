@@ -66,6 +66,8 @@ def risk_exit_proposals(
         # for tournament variance instead of grinding half-exits every cycle.
         if cfg.bot_take_profit_frac < 1.0 and upnl_pct >= cfg.bot_take_profit_frac:
             should_exit = True
+            # Full exit — half-cuts left us cash-starved with winners still locked.
+            full_exit = True
             reason = f"Take profit: unrealized {upnl_pct:.0%} >= {cfg.bot_take_profit_frac:.0%}"
             priority = 900 + upnl_pct * 100
         elif idea is not None:

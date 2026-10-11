@@ -76,6 +76,7 @@ def test_take_profit_fires_at_15_percent() -> None:
     props = risk_exit_proposals(positions, [], cfg)
     assert len(props) == 1
     assert props[0].action == "sell"
+    assert props[0].quantity == 1_000  # full exit, not half
     assert "Take profit" in props[0].reason
 
 
