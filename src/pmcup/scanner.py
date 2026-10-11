@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import json
+import logging
+from pathlib import Path
 from typing import Any
 
 from .client import SuperMarketClient
@@ -10,34 +13,107 @@ from .fair_probs import load_fair_probs
 from .models import Quote, TradeIdea
 from .portfolio import cash_and_equity
 
+log = logging.getLogger("pmcup.scanner")
+
+_TOURNAMENT_CACHE = Path("data/bots/tournament_cache.json")
+
+
+def _tournament_cache_path() -> Path:
+    return _TOURNAMENT_CACHE
+
+
+def _load_tournament_cache(slug: str | None) -> tuple[str, str, float] | None:
+    path = _tournament_cache_path()
+    if not path.exists():
+        return None
+    try:
+        raw = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    cached_slug = str(raw.get("slug") or "")
+    cached_id = raw.get("id")
+    if not cached_slug or cached_id is None:
+        return None
+    if slug and cached_slug != slug:
+        return None
+    try:
+        bankroll = float(raw.get("bankroll") or raw.get("myBalance") or 100_000)
+    except (TypeError, ValueError):
+        bankroll = 100_000.0
+    return cached_slug, str(cached_id), bankroll
+
+
+def _save_tournament_cache(slug: str, tournament_id: str, bankroll: float) -> None:
+    path = _tournament_cache_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {"slug": slug, "id": tournament_id, "bankroll": bankroll},
+            indent=1,
+        )
+    )
+
+
+def _match_bankroll(match: dict[str, Any]) -> float:
+    return float(match.get("myBalance") or match.get("initialBalance") or 100_000)
+
 
 def _resolve_tournament(client: SuperMarketClient, cfg: Settings) -> tuple[str, str, float]:
-    tournaments = client.tournaments(status="any")
-    if not tournaments:
-        raise SystemExit("No tournaments visible on this API key. Register/activate your account first.")
-
+    """Resolve tournament id without depending on the flaky /tournaments list."""
     slug = cfg.tournament_slug
-    if slug:
-        match = next((t for t in tournaments if t.get("slug") == slug), None)
-        if not match:
-            names = ", ".join(f"{t.get('slug')} ({t.get('name')})" for t in tournaments)
-            raise SystemExit(f"Tournament slug '{slug}' not found. Available: {names}")
-    else:
-        match = next(
-            (
-                t
-                for t in tournaments
-                if any(
-                    k in (t.get("name") or "").lower() + (t.get("slug") or "").lower()
-                    for k in ("midterm", "prediction", "cup", "election")
-                )
-            ),
-            tournaments[0],
-        )
-        slug = match["slug"]
+    match: dict[str, Any] | None = None
 
-    bankroll = float(match.get("myBalance") or match.get("initialBalance") or 100_000)
-    return slug, str(match["id"]), bankroll
+    # Prefer direct slug lookup — the list endpoint 503s more often.
+    if slug:
+        try:
+            raw = client.tournament(slug)
+            match = raw.get("data") if isinstance(raw, dict) and "data" in raw and "id" not in raw else raw
+            if not isinstance(match, dict) or match.get("id") is None:
+                match = None
+        except Exception as exc:  # noqa: BLE001
+            log.warning("tournament(%s) failed: %s", slug, exc)
+
+    if match is None:
+        try:
+            tournaments = client.tournaments(status="any")
+        except Exception as exc:  # noqa: BLE001
+            log.warning("tournaments list failed: %s", exc)
+            tournaments = []
+        if tournaments:
+            if slug:
+                match = next((t for t in tournaments if t.get("slug") == slug), None)
+                if match is None:
+                    names = ", ".join(f"{t.get('slug')} ({t.get('name')})" for t in tournaments)
+                    raise SystemExit(f"Tournament slug '{slug}' not found. Available: {names}")
+            else:
+                match = next(
+                    (
+                        t
+                        for t in tournaments
+                        if any(
+                            k in (t.get("name") or "").lower() + (t.get("slug") or "").lower()
+                            for k in ("midterm", "prediction", "cup", "election")
+                        )
+                    ),
+                    tournaments[0],
+                )
+                slug = match["slug"]
+
+    if match is None:
+        cached = _load_tournament_cache(slug or None)
+        if cached:
+            log.warning("using cached tournament %s id=%s", cached[0], cached[1])
+            return cached
+        raise SystemExit(
+            "No tournaments visible on this API key (and no cache). "
+            "Register/activate your account first."
+        )
+
+    slug = str(match.get("slug") or slug)
+    tournament_id = str(match["id"])
+    bankroll = _match_bankroll(match)
+    _save_tournament_cache(slug, tournament_id, bankroll)
+    return slug, tournament_id, bankroll
 
 
 def build_quotes(
@@ -84,7 +160,13 @@ def scan(cfg: Settings | None = None) -> dict[str, Any]:
     cfg = cfg or settings
     with SuperMarketClient(cfg) as client:
         slug, tournament_id, listed_balance = _resolve_tournament(client, cfg)
-        account = client.account()
+        account: dict[str, Any] = {}
+        try:
+            account = client.account()
+        except Exception as exc:  # noqa: BLE001
+            # Account endpoint flakes independently; size off tournament cash.
+            log.warning("account() failed, using tournament balance: %s", exc)
+            account = {"balance": listed_balance}
         positions: dict[str, Any] = {"positions": []}
         try:
             positions = client.positions(slug)
