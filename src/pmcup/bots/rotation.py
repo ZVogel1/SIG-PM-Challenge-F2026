@@ -28,6 +28,7 @@ from ..config import Settings
 from ..edge import race_key_from_title
 from ..models import TradeIdea
 from .risk import exit_limit_price
+from .strategies import buy_price_in_band
 from .types import OrderProposal
 
 log = logging.getLogger("pmcup.bots")
@@ -179,12 +180,14 @@ def rotation_proposals(
         own_mark = (1.0 - mark) if side == "no" else mark
         race_notional[race] = race_notional.get(race, 0.0) + abs(qty) * max(own_mark, 0.0)
 
-    # Best idea in a race we don't already hold (party mirrors count as one race)
+    # Best idea in a race we don't already hold (party mirrors count as one race).
+    # Same price band as edge_hunter — don't rotate into pennies or 80c favorites.
     candidates = [
         i
         for i in ideas
         if i.action == "buy"
         and float(i.net_edge) >= float(cfg.min_edge)
+        and buy_price_in_band(i.market_price, cfg)
         and str(i.exchange_id) not in held
         and (i.race_key or race_key_from_title(i.market_title)) not in held_races
         and not locked(state, i.exchange_id, "buy")

@@ -44,9 +44,15 @@ class Settings(BaseSettings):
     bot_enable_constraint: bool = True
     bot_enable_risk: bool = True
     bot_exit_net_edge: float = 0.01  # flatten when net edge collapses below this
-    bot_take_profit_frac: float = 0.35  # sell if uPnL% exceeds this (paper/live)
+    # Bank winners before they mean-revert. 50% was too sticky; 25% frees cash
+    # while the thesis is still working.
+    bot_take_profit_frac: float = 0.25
     # Underwater trim when no scan idea exists for the position
     bot_underwater_exit_frac: float = -0.20
+    # Refuse buys outside this band: sub-dime longshots and 75c+ favorites have
+    # terrible tournament payoff even when the model shows a fat "edge".
+    buy_min_price: float = 0.12
+    buy_max_price: float = 0.65
     # Keep dry powder for new edges (0 = allow full deploy).
     # Leave at 0: forcing a cash level makes the bot sell positions the buyer
     # then immediately re-buys, which just pays the spread in a loop.

@@ -12,6 +12,17 @@ def _flb_allowed(cfg: Settings) -> bool:
     return cfg.allow_flb_paper
 
 
+def buy_price_in_band(price: float | None, cfg: Settings) -> bool:
+    """True when a buy price sits in the configured tournament payoff band."""
+    if price is None:
+        return False
+    try:
+        px = float(price)
+    except (TypeError, ValueError):
+        return False
+    return float(cfg.buy_min_price) <= px <= float(cfg.buy_max_price)
+
+
 def proposals_from_edge_ideas(
     ideas: list[TradeIdea],
     *,
@@ -28,6 +39,8 @@ def proposals_from_edge_ideas(
         if idea.source == "constraint":
             continue
         if idea.source == "flb" and not allow_flb:
+            continue
+        if idea.action == "buy" and not buy_price_in_band(idea.market_price, cfg):
             continue
         out.append(
             OrderProposal(

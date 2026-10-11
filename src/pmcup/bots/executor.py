@@ -239,6 +239,17 @@ class Executor:
                 if qty <= 0:
                     continue
             elif p.action == "buy":
+                from .strategies import buy_price_in_band
+
+                if not buy_price_in_band(p.price, self.cfg):
+                    log.info(
+                        "Skip buy — price %.3f outside band [%.2f, %.2f]: %s",
+                        float(p.price or 0),
+                        self.cfg.buy_min_price,
+                        self.cfg.buy_max_price,
+                        p.market_title[:50],
+                    )
+                    continue
                 if size_mult < 1.0:
                     qty = max(0, int(qty * size_mult))
                 title = p.market_title or ""
