@@ -44,9 +44,9 @@ class Settings(BaseSettings):
     bot_enable_constraint: bool = True
     bot_enable_risk: bool = True
     bot_exit_net_edge: float = 0.01  # flatten when net edge collapses below this
-    # Bank winners before they mean-revert. 50% was too sticky; 25% frees cash
-    # while the thesis is still working.
-    bot_take_profit_frac: float = 0.25
+    # Bank winners before they mean-revert. 25% still left Oregon (+18%) sitting;
+    # 15% actually frees cash while the book is fully invested.
+    bot_take_profit_frac: float = 0.15
     # Underwater trim when no scan idea exists for the position
     bot_underwater_exit_frac: float = -0.20
     # Refuse buys outside this band: sub-dime longshots and 75c+ favorites have

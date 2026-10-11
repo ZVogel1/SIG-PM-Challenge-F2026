@@ -182,9 +182,11 @@ class SuperMarketClient:
         *,
         tournament_id: str | None = None,
     ) -> list[dict[str, Any]]:
+        # Smaller chunks: 100-id URLs were 503'ing and killing whole scan cycles.
         results: list[dict[str, Any]] = []
-        for i in range(0, len(exchange_ids), 100):
-            chunk = exchange_ids[i : i + 100]
+        chunk_size = 40
+        for i in range(0, len(exchange_ids), chunk_size):
+            chunk = exchange_ids[i : i + chunk_size]
             payload = self._get(
                 "/exchanges/prices",
                 ids=",".join(chunk),

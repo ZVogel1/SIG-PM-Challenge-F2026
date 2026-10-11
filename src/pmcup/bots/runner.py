@@ -173,9 +173,12 @@ def run_cycle(cfg: Settings, *, cycle: int = 0) -> dict[str, Any]:
             and float(equity_now or 0) > 0
             and cash_f < float(equity_now or 0) * target_frac
         )
+        # Fully invested with pennies of cash: risk exits / take-profits must
+        # run before buys or we spend the whole cycle shrinking buys to zero.
+        cash_starved = cash_f < max(25.0, 0.002 * float(equity_now or 0))
         # Rotation sells always go first: the funding buy is useless until cash
         # exists, and a resting prior sell must be resolved before we spam buys.
-        if cash_short or rotation_sells:
+        if cash_short or cash_starved or rotation_sells:
             merged = rotation_sells + other_sells + list(best_buy.values())
         else:
             merged = list(best_buy.values()) + other_sells
