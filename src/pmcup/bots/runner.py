@@ -20,7 +20,7 @@ from ..portfolio import cash_and_equity
 from ..scanner import scan
 from ..trading_window import window_status
 from .executor import Executor, bots_dir
-from .risk import cash_buffer_proposals, risk_exit_proposals
+from .risk import cash_buffer_proposals, risk_exit_proposals, weak_lot_trim_proposals
 from .rotation import (
     record_fills as record_rotation_fills,
     filter_buys as filter_rotation_buys,
@@ -142,6 +142,15 @@ def run_cycle(cfg: Settings, *, cycle: int = 0) -> dict[str, Any]:
                         cfg=cfg,
                     )
                 )
+            proposals.extend(
+                weak_lot_trim_proposals(
+                    positions,
+                    ideas,
+                    cash=cash_f,
+                    equity=float(equity_now or 0),
+                    cfg=cfg,
+                )
+            )
             rotations, rotation_state = rotation_proposals(
                 positions,
                 ideas,

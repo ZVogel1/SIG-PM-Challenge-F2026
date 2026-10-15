@@ -131,6 +131,15 @@ def risk_exit_proposals(
     return out
 
 
+def _same_side_held_edge(idea: TradeIdea | None, side: str) -> float:
+    """Edge only counts if the scan still wants to buy this same side."""
+    if idea is None:
+        return 0.0
+    if idea.side == side and idea.action == "buy":
+        return float(idea.net_edge)
+    return 0.0
+
+
 def cash_buffer_proposals(
     positions_payload: dict[str, Any],
     *,
@@ -197,6 +206,100 @@ def cash_buffer_proposals(
                 priority=620 + max(0.0, -upnl_pct) * 50,
                 race_key=race_key_from_title(title),
                 tags=["risk", "cash_buffer"],
+            )
+        )
+        freed += notional
+    return out
+
+
+def weak_lot_trim_proposals(
+    positions_payload: dict[str, Any],
+    ideas: list[TradeIdea],
+    *,
+    cash: float,
+    equity: float,
+    cfg: Settings,
+) -> list[OrderProposal]:
+    """
+    When fully invested, free a little cash by trimming lots the model no longer
+    backs — never winners with live same-side edge (avoids the old cash-buffer churn).
+    """
+    if not bool(getattr(cfg, "weak_trim_enabled", True)):
+        return []
+    if equity <= 0:
+        return []
+    # Only when cash is effectively gone.
+    if cash >= max(25.0, 0.002 * equity):
+        return []
+    budget = equity * float(getattr(cfg, "weak_trim_cash_frac", 0.02) or 0.0)
+    if budget <= 0:
+        return []
+    max_n = max(1, int(getattr(cfg, "weak_trim_max_positions", 2) or 2))
+    min_edge = float(cfg.min_edge)
+
+    idea_by_ex: dict[str, TradeIdea] = {i.exchange_id: i for i in ideas}
+    ranked: list[tuple[float, float, dict[str, Any], str]] = []
+    for pos in positions_payload.get("positions") or []:
+        if pos.get("settled"):
+            continue
+        qty = float(pos.get("quantity") or 0)
+        abs_qty = int(abs(qty))
+        if abs_qty < int(cfg.bot_min_order_qty):
+            continue
+        side = "yes" if qty > 0 else "no"
+        exchange_id = str(pos.get("exchangeId"))
+        held_edge = _same_side_held_edge(idea_by_ex.get(exchange_id), side)
+        if held_edge >= min_edge:
+            continue  # still a live thesis — leave it alone
+        upnl_pct = float(pos.get("unrealizedPnlPct") or 0) / 100.0
+        # Prefer flat/red dead lots; never trim something already past take-profit
+        # (risk_exit handles those).
+        if upnl_pct >= float(cfg.bot_take_profit_frac):
+            continue
+        ranked.append((held_edge, upnl_pct, pos, side))
+    ranked.sort(key=lambda x: (x[0], x[1]))  # weakest edge, then worst uPnL
+
+    out: list[OrderProposal] = []
+    freed = 0.0
+    for held_edge, upnl_pct, pos, side in ranked[: max_n * 2]:
+        if len(out) >= max_n or freed >= budget:
+            break
+        abs_qty = int(abs(float(pos.get("quantity") or 0)))
+        # Half-cut, capped so one dog doesn't dump the whole race in one cycle.
+        sell_qty = max(int(cfg.bot_min_order_qty), abs_qty // 2)
+        sell_qty = min(sell_qty, abs_qty)
+        px = exit_limit_price(pos.get("currentPrice"), side)
+        if px is None:
+            continue
+        notional = sell_qty * px
+        if notional <= 0:
+            continue
+        # Don't overshoot the cash budget by more than ~25%.
+        if freed > 0 and freed + notional > budget * 1.25:
+            room = budget - freed
+            if room < 25 * px:
+                continue
+            sell_qty = max(int(cfg.bot_min_order_qty), int(room / px))
+            sell_qty = min(sell_qty, abs_qty)
+            notional = sell_qty * px
+        title = str(pos.get("marketTitle") or pos.get("exchangeId") or "")
+        out.append(
+            OrderProposal(
+                bot="risk_manager",
+                exchange_id=str(pos.get("exchangeId")),
+                market_id=str(pos.get("marketId") or ""),
+                market_title=title,
+                side=side,
+                action="sell",
+                quantity=sell_qty,
+                price=px,
+                reason=(
+                    f"Weak trim: cash-starved; held edge {held_edge:.1%} "
+                    f"< {min_edge:.0%}, uPnL {upnl_pct:.0%}"
+                ),
+                priority=610 + max(0.0, -upnl_pct) * 40,
+                race_key=race_key_from_title(title),
+                tags=["risk", "weak_trim"],
             )
         )
         freed += notional

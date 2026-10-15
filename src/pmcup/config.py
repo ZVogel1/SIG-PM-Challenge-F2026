@@ -44,9 +44,9 @@ class Settings(BaseSettings):
     bot_enable_constraint: bool = True
     bot_enable_risk: bool = True
     bot_exit_net_edge: float = 0.01  # flatten when net edge collapses below this
-    # Bank winners before they mean-revert. 25% still left Oregon (+18%) sitting;
-    # 15% actually frees cash while the book is fully invested.
-    bot_take_profit_frac: float = 0.15
+    # Bank winners before they mean-revert. 12% unlocks near-TP names (TX-23
+    # etc.) while the book is fully invested without grinding every small bump.
+    bot_take_profit_frac: float = 0.12
     # Underwater trim when no scan idea exists for the position
     bot_underwater_exit_frac: float = -0.20
     # Refuse buys outside this band: sub-dime longshots and 75c+ favorites have
@@ -57,6 +57,10 @@ class Settings(BaseSettings):
     # Leave at 0: forcing a cash level makes the bot sell positions the buyer
     # then immediately re-buys, which just pays the spread in a loop.
     target_cash_frac: float = 0.0
+    # When cash is ~0, trim dead 0-edge lots (not winners) up to this equity frac.
+    weak_trim_enabled: bool = True
+    weak_trim_cash_frac: float = 0.02
+    weak_trim_max_positions: int = 2
 
     # Capital rotation: sell a tired position only to fund a clearly better one
     rotation_enabled: bool = True

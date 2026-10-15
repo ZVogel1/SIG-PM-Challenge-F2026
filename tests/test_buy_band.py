@@ -11,7 +11,7 @@ def _cfg(**over) -> Settings:
         "supermarket_api_key": "test",
         "buy_min_price": 0.12,
         "buy_max_price": 0.65,
-        "bot_take_profit_frac": 0.15,
+        "bot_take_profit_frac": 0.12,
         "bot_underwater_exit_frac": -0.20,
     }
     base.update(over)
@@ -58,8 +58,8 @@ def test_edge_hunter_skips_pennies_and_favorites() -> None:
     assert props[0].price == 0.40
 
 
-def test_take_profit_fires_at_15_percent() -> None:
-    cfg = _cfg(bot_take_profit_frac=0.15)
+def test_take_profit_fires_at_12_percent() -> None:
+    cfg = _cfg(bot_take_profit_frac=0.12)
     positions = {
         "positions": [
             {
@@ -68,7 +68,7 @@ def test_take_profit_fires_at_15_percent() -> None:
                 "marketTitle": "Will the Republican Party win the Maine Senate?",
                 "quantity": 1_000,
                 "currentPrice": 0.50,
-                "unrealizedPnlPct": 18.0,  # API reports percent points
+                "unrealizedPnlPct": 13.0,  # API reports percent points
                 "settled": False,
             }
         ]
@@ -81,7 +81,7 @@ def test_take_profit_fires_at_15_percent() -> None:
 
 
 def test_take_profit_does_not_fire_below_threshold() -> None:
-    cfg = _cfg(bot_take_profit_frac=0.15)
+    cfg = _cfg(bot_take_profit_frac=0.12)
     positions = {
         "positions": [
             {
